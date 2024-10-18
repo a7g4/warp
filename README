@@ -1,0 +1,19 @@
+# Weighted Aggregation & Resiliency Protocol
+
+## Build
+
+Once checked out, run:
+
+```
+make
+```
+
+## Run
+
+In the build directory, run:
+
+```
+build/warp
+```
+
+There is a sample client that writes to a unix socket to test local round-trip latency (no physical network involved)
