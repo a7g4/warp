@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "warp",
+    "warp-config",
+    "warp-gf256",
+    "warp-map",
+    "warp-protocol",
+    "warp-protocol-derive",
+]
+resolver = "2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

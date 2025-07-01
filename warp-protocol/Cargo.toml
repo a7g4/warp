@@ -1,0 +1,17 @@
+[package]
+name = "warp-protocol"
+version = "0.2.0"
+edition = "2021"
+
+
+[dependencies]
+base32 = "~0"
+bincode = { version = "~2", features = ["serde"] }
+aead = { version = "~0.6.0-rc.1", features = ["alloc", "os_rng"] }
+chacha20poly1305 = "~0.11.0-rc.0"
+k256 = { version = "~0.14.0-pre.8", features = ["serde", "ecdh"] }
+sha3 = "~0.11.0-rc.0"
+thiserror = "~2"
+rand = "~0"
+
+warp-protocol-derive = { path = "../warp-protocol-derive" }

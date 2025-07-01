@@ -1,0 +1,33 @@
+[package]
+name = "warp"
+version = "0.1.0"
+edition = "2024"
+default-run = "warp"
+
+[[bin]]
+name = "warp"
+path = "src/main.rs"
+
+
+[[bin]]
+name = "warp-keygen"
+path = "src/generate_key.rs"
+
+[dependencies]
+console-subscriber = "~0"
+tokio = { version = "1", features = ["full", "tracing"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rand = "~0.9"
+
+# Networking
+pnet = "~0"
+toml = "~0"
+regex = "~1"
+
+warp-config = { path = "../warp-config" }
+warp-protocol = { path = "../warp-protocol" }
