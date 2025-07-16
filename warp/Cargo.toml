@@ -31,3 +31,4 @@ regex = "~1"
 
 warp-config = { path = "../warp-config" }
 warp-protocol = { path = "../warp-protocol" }
+libc = "1.0.0-alpha.1"

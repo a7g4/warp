@@ -52,6 +52,7 @@ where
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InterfacesConfig {
     pub interface_scan_interval: u64,
+    pub use_bind_to_device: Option<bool>,
     #[serde(
         serialize_with = "serialize_interface_exclusions",
         deserialize_with = "deserialize_interface_exclusions"
@@ -131,7 +132,9 @@ pub struct UnixDomainSocketConfig {
 pub struct LoopbackConfig {
     pub ipv4: bool,
     pub application_to_gate: u16,
-    pub gate_to_application: u16,
+    // If gate_to_application is None, application data will be sent to the last socket address that
+    // sent data to the application_to_gate port
+    pub gate_to_application: Option<u16>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

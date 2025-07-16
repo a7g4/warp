@@ -1,8 +1,7 @@
 use clap::Parser;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use tracing::info;
 use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
@@ -31,7 +30,9 @@ impl WarpCore {
 
     async fn run(&mut self) {
         let mut futures = futures::stream::FuturesUnordered::new();
-        let (interfaces_tx, interfaces_rx) = tokio::sync::watch::channel(interface::InterfaceMap::new());
+        // Using a Vec seems the smartest for small numbers of interfaces; switch to a Map if we ever get to large numbers
+        let (interfaces_tx, interfaces_rx) =
+            tokio::sync::watch::channel(Vec::<std::sync::Arc<interface::NetworkInterface>>::new());
         let (peer_addresses_tx, peer_addresses_rx) = tokio::sync::watch::channel(Vec::<std::net::SocketAddr>::new());
         let interface_filter = self.warp_config.interfaces.exclusion_patterns.clone();
 
@@ -51,7 +52,7 @@ impl WarpCore {
             .name("interface scan task")
             .spawn({
                 let warp_config = self.warp_config.clone();
-                let mut interfaces = interface::InterfaceMap::new();
+                let mut interfaces = Vec::new();
                 let interfaces_tx = interfaces_tx.clone();
                 async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -72,27 +73,36 @@ impl WarpCore {
                                         .ips
                                         .iter()
                                         .find(|ip| matches!(ip.ip(), std::net::IpAddr::V4(_)))
-                                        .map(|ip| crate::interface::NetworkInterfaceIdentifier {
+                                        .map(|ip| crate::interface::NetworkInterfaceId {
                                             name: iface.name.clone(),
                                             ip: ip.ip(),
                                         })
                                 })
                                 .collect();
 
-                            interfaces.retain(|existing_id, existing_interface| {
-                                let retain = ipv4_interfacse.iter().any(|current_id| existing_id == current_id);
+                            interfaces.retain(|existing_interface: &std::sync::Arc<interface::NetworkInterface>| existing_interface.is_alive());
+                            interfaces.retain(|existing_interface: &std::sync::Arc<interface::NetworkInterface>| {
+                                let retain = ipv4_interfacse
+                                    .iter()
+                                    .any(|current_id| &existing_interface.id == current_id);
                                 if !retain {
-                                    info!("Interface {existing_id}) no longer detected; removing");
+                                    tracing::info!("Interface {} no longer detected; removing", existing_interface.id);
                                 }
                                 retain
                             });
 
-                            for interface_id in ipv4_interfacse {
-                                interfaces.entry(interface_id.clone()).or_insert_with(|| {
-                                    info!("Adding new interface {}", interface_id);
-                                    crate::interface::NetworkInterface::new(&interface_id, &warp_config, tx.clone())
-                                        .unwrap()
-                                });
+                            let new_interface_ids: Vec<_> = ipv4_interfacse
+                                .iter()
+                                .filter(|new_interface| {
+                                    !interfaces.iter().any(|existing_interface| &existing_interface.id == *new_interface)
+                                })
+                                .collect();
+
+                            for new_interface_id in new_interface_ids {
+                                match interface::NetworkInterface::new(new_interface_id.clone(), &warp_config, tx.clone()) {
+                                    Ok(new_interface) => interfaces.push(new_interface),
+                                    Err(e) => tracing::warn!("Failed to create new interface {}: {}", new_interface_id, e),
+                                }
                             }
                         }
                         interfaces_tx.send_replace(interfaces.clone());
@@ -118,20 +128,59 @@ impl WarpCore {
                 .name(&format!("warp-gate {}: data accelerator", warp_tunnel_name))
                 .spawn({
                     let tunnel_id: [u8; 8] = tunnel_id.to_le_bytes();
+                    let warp_tunnel_name = warp_tunnel_name.to_owned();
                     let interfaces_rx = interfaces_rx.clone();
                     let peer_addresses_rx = peer_addresses_rx.clone();
                     let peer_cipher = peer_cipher.clone();
                     async move {
                         while let Some(data) = rx.recv().await {
+                            let queue_len = rx.len();
+                            tracing::debug!("warp-gate {}: Outbound queue length {}", &warp_tunnel_name, queue_len);
+                            let data_len = data.len();
                             let msg = warp_protocol::messages::TunnelPayload { tunnel_id, data };
-                            let interfaces = interfaces_rx.borrow().clone();
+
+                            let mut interfaces = interfaces_rx.borrow().clone();
+                            interfaces.retain(|interface| interface.is_alive());
+
                             let peer_addresses = peer_addresses_rx.borrow().clone();
-                            for (interface_id, interface) in interfaces.iter() {
-                                for peer_address in peer_addresses.iter() {
-                                    interface
-                                        .send_to(msg.clone(), peer_address, &peer_cipher)
-                                        .await
-                                        .unwrap();
+
+                            // TODO: Here is where we can pick the routes from the cross product of interfaces and peer addresses
+                            let send_futures = interfaces
+                                .iter()
+                                .flat_map(|interface| {
+                                    peer_addresses.iter().map(move |peer_address| (interface, peer_address))
+                                })
+                                .map(|(interface, &peer_address)| {
+                                    let peer_cipher = peer_cipher.clone();
+                                    let interface = interface.clone();
+                                    let peer_address = peer_address;
+                                    let msg = msg.clone();
+                                    async move {
+                                        (
+                                            interface.clone(),
+                                            peer_address,
+                                            interface.send_to(msg, &peer_address, &peer_cipher).await,
+                                        )
+                                    }
+                                });
+                            let mut send_completions = futures::stream::FuturesUnordered::from_iter(send_futures);
+                            while let Some(completion) = send_completions.next().await {
+                                match completion {
+                                    (interface, peer_address, Ok(())) => tracing::debug!(
+                                        "warp-tunnel {} - Forwarded {} byte payload from {} to {}",
+                                        &warp_tunnel_name,
+                                        data_len,
+                                        interface.id,
+                                        peer_address
+                                    ),
+                                    (interface, peer_address, Err(e)) => tracing::warn!(
+                                        "warp-tunnel {} - Error forwarding {} byte payload from {} to {}: {}",
+                                        &warp_tunnel_name,
+                                        data_len,
+                                        interface.id,
+                                        peer_address,
+                                        e
+                                    ),
                                 }
                             }
                         }
@@ -144,18 +193,18 @@ impl WarpCore {
         let tunnel_gates = std::sync::Arc::new(tunnel_gates);
 
         let rx_processing_task = tokio::task::Builder::new()
-            .name("rx processing task")
+            .name("global rx processor")
             .spawn({
                 let peer_addresses_tx = peer_addresses_tx.clone();
                 let warp_config = self.warp_config.clone();
                 let warp_map_cipher = warp_map_cipher.clone();
-                let peer_cipher = peer_cipher.clone();
                 let tunnel_gates = tunnel_gates.clone();
                 async move {
                     while let Some(payload) = rx.recv().await {
                         let mut remaining_buf = payload.data.as_slice();
                         loop {
                             let (msg, buf) = warp_protocol::codec::WireMessage::from_slice(remaining_buf).unwrap();
+                            tracing::trace!("Received {} bytes from {} by {}", payload.data.len(), payload.from, payload.receiver);
 
                             match payload.from {
                                 from if from == warp_config.warp_map.address => {
@@ -165,7 +214,7 @@ impl WarpCore {
                                             let register_response =
                                                 warp_protocol::messages::RegisterResponse::decode(decrypted_wire_msg)
                                                     .unwrap();
-                                            info!(
+                                            tracing::info!(
                                                 "{} is visible publicly at {}",
                                                 payload.receiver, register_response.address
                                             );
@@ -186,10 +235,11 @@ impl WarpCore {
                                                 tracing::Level::INFO,
                                                 peer_addresses = mapping.endpoints.len()
                                             );
+                                            tracing::debug!("Peer addresses: {:?}", mapping.endpoints);
                                             peer_addresses_tx.send_replace(mapping.endpoints);
                                         }
                                         _ => {
-                                            info!(
+                                            tracing::info!(
                                                 "Received unexpected message from warp-map: {:?}",
                                                 decrypted_wire_msg
                                             );
@@ -211,12 +261,15 @@ impl WarpCore {
                                                         tracing::warn!(
                                                             "Received data at {} for unknown tunnel {} from {}",
                                                             &payload.receiver,
-                                                            from,
-                                                            tunnel_id
+                                                            tunnel_id,
+                                                            from
                                                         );
                                                     }
                                                     Some(gate) => {
-                                                        gate.send_to_application(&tunnel_payload.data).await.unwrap();
+                                                        match gate.send_to_application(&tunnel_payload.data).await {
+                                                            Ok(()) => { tracing::debug!("Forwarded {} bytes to application on tunnel {}", tunnel_payload.data.len(), gate.tunnel_name); },
+                                                            Err(e) => { tracing::error!("Error sending message to application for tunnel {}: {}", gate.tunnel_name, e); }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -230,7 +283,7 @@ impl WarpCore {
                                             }
                                         }
                                     } else {
-                                        info!(
+                                        tracing::info!(
                                             "Received invalid message at {} from {}; ignoring",
                                             &payload.receiver, from
                                         );
@@ -250,7 +303,7 @@ impl WarpCore {
         futures.push(rx_processing_task);
 
         while futures.next().await.is_some() {
-            println!(".");
+            panic!("warp terminated")
         }
     }
 }
@@ -260,7 +313,7 @@ fn main() -> anyhow::Result<()> {
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_span_events(FmtSpan::CLOSE)
-        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
     let tokio_console_layer = console_subscriber::spawn();
 
     tracing_subscriber::registry()
@@ -277,7 +330,7 @@ async fn async_main() -> anyhow::Result<()> {
     let warp_config: warp_config::WarpConfig =
         toml::from_str(std::fs::read_to_string(args.warp_config_path)?.as_str())?;
 
-    info!(
+    tracing::info!(
         "Public key: {}",
         warp_protocol::crypto::pubkey_to_string(&warp_config.private_key.public_key())
     );

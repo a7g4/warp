@@ -1,144 +1,172 @@
-use futures::SinkExt;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, mpsc, watch};
+use tokio::task::JoinHandle;
+use warp_config::WarpGateConfig;
 
-// The warp tunnel "Gate" is the interface between warp and external applications
-pub(crate) struct Gate {
-    socket: GateSocket,
-    rx_task: OnceCell<tokio::task::JoinHandle<()>>,
-}
+const BUFFER_SIZE: usize = 65536;
 
-enum GateSocket {
+enum ApplicationSocket {
     Loopback {
         socket: tokio::net::UdpSocket,
-        destination: std::net::SocketAddr,
+        fixed_destination: Option<std::net::SocketAddr>,
+        current_destination: watch::Sender<Option<std::net::SocketAddr>>,
     },
-    UnixDomainSocket {
-        socket: tokio::net::UnixDatagram,
-    },
+    UnixDomainSocket(tokio::net::UnixDatagram),
+}
+
+impl ApplicationSocket {
+    async fn recv_and_forward(
+        &self,
+        buf: &mut [u8],
+        tx_channel: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let size: anyhow::Result<usize> = match self {
+            Self::Loopback {
+                socket,
+                fixed_destination,
+                current_destination,
+            } => {
+                let (size, addr) = socket.recv_from(buf).await?;
+
+                // Update destination if not fixed
+                if fixed_destination.is_none() {
+                    current_destination.send_replace(Some(addr));
+                }
+
+                Ok(size)
+            }
+            Self::UnixDomainSocket(socket) => {
+                let size = socket.recv(buf).await?;
+                Ok(size)
+            }
+        };
+
+        Ok(tx_channel.send(buf[..size?].to_vec())?)
+    }
+
+    async fn send(&self, data: &[u8], fallback_addr: Option<std::net::SocketAddr>) -> anyhow::Result<usize> {
+        match self {
+            Self::Loopback {
+                socket,
+                fixed_destination,
+                ..
+            } => match (fixed_destination, fallback_addr) {
+                (Some(fixed_destination), _) => Ok(socket.send_to(data, fixed_destination).await?),
+                (None, Some(fallback_addr)) => Ok(socket.send_to(data, fallback_addr).await?),
+                (None, None) => Err(anyhow::anyhow!("no destination address provided"))?,
+            },
+            Self::UnixDomainSocket(socket) => Ok(socket.send(data).await?),
+        }
+    }
+}
+
+pub struct Gate {
+    pub(crate) tunnel_name: String,
+    socket: Arc<ApplicationSocket>,
+    current_destination: watch::Receiver<Option<std::net::SocketAddr>>,
+    _task: OnceCell<JoinHandle<()>>,
 }
 
 impl Gate {
-    pub(crate) fn new(
+    pub fn new(
         tunnel_name: &str,
-        gate_config: warp_config::WarpGateConfig,
-        rx_channel: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        config: WarpGateConfig,
+        tx_channel: mpsc::UnboundedSender<Vec<u8>>,
     ) -> anyhow::Result<Arc<Self>> {
-        let gate = Arc::new(match gate_config {
-            warp_config::WarpGateConfig::Loopback(config) => {
-                let bind_address = SocketAddr::new(
-                    match config.ipv4 {
-                        true => std::net::Ipv4Addr::LOCALHOST.into(),
-                        false => std::net::Ipv6Addr::LOCALHOST.into(),
-                    },
-                    config.application_to_gate,
-                );
-                let destination_address = SocketAddr::new(
-                    match config.ipv4 {
-                        true => std::net::Ipv4Addr::LOCALHOST.into(),
-                        false => std::net::Ipv6Addr::LOCALHOST.into(),
-                    },
-                    config.gate_to_application,
-                );
-                let raw_socket = std::net::UdpSocket::bind(bind_address)?;
-                raw_socket.set_nonblocking(true)?;
-                let tokio_socket = tokio::net::UdpSocket::from_std(raw_socket)?;
-                tracing::info!(
-                    "warp-gate {}: waiting for application data at {}, forwarding tunnel data to {}",
-                    tunnel_name,
-                    bind_address,
-                    destination_address
-                );
-                Self {
-                    socket: GateSocket::Loopback {
-                        socket: tokio_socket,
-                        destination: destination_address,
-                    },
-                    rx_task: OnceCell::new(),
-                }
-            }
-            warp_config::WarpGateConfig::UnixDomainSocket(path) => {
-                // TODO: Is there a more robust way than just deleting whatever's at the path?
-                match std::fs::remove_file(&path.path) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                }?;
-                let socket = tokio::net::UnixDatagram::bind(&path.path)?;
-                tracing::info!(
-                    "warp-gate {}: reading and writing from {}",
-                    tunnel_name,
-                    path.path.display()
-                );
-                Self {
-                    socket: GateSocket::UnixDomainSocket { socket },
-                    rx_task: OnceCell::new(),
-                }
-            }
+        let (dest_tx, dest_rx) = watch::channel(None);
+
+        let socket = Self::create_socket(&config, tunnel_name, dest_tx)?;
+        let socket = Arc::new(socket);
+
+        let gate = Arc::new(Self {
+            tunnel_name: tunnel_name.to_string(),
+            socket: socket.clone(),
+            current_destination: dest_rx,
+            _task: OnceCell::new(),
         });
 
-        let weak_interface = Arc::downgrade(&gate);
-        let rx_task = tokio::task::Builder::new()
+        let task = tokio::task::Builder::new()
             .name(&format!("warp-gate {}: application listener", tunnel_name))
             .spawn({
                 let tunnel_name = tunnel_name.to_string();
+                let socket = socket.clone();
                 async move {
-                    let mut buf = vec![0u8; 1500];
-                    let gate = weak_interface.upgrade().unwrap();
+                    let mut buf = vec![0u8; BUFFER_SIZE];
                     loop {
-                        match gate.recv_from_application(&mut buf).await {
-                            Err(err) => {
-                                tracing::error!("Error receiving message by gate {}: {}", tunnel_name, err);
-                            }
-                            Ok(recv_size) => {
-                                if let Err(err) = rx_channel.send(buf[..recv_size].to_vec()) {
-                                    tracing::error!("Error proxying message to processing queue: {}", err)
-                                }
-                            }
+                        if let Err(e) = socket.recv_and_forward(&mut buf, &tx_channel).await {
+                            tracing::error!("warp-gate {}: recv error: {}", tunnel_name, e);
                         }
                     }
                 }
             })?;
 
-        gate.rx_task
-            .set(rx_task)
-            .map_err(|_| anyhow::anyhow!("Failed to set rx task"))?;
-
+        gate._task.set(task).map_err(|_| anyhow::anyhow!("Task already set"))?;
         Ok(gate)
     }
 
-    async fn recv_from_application(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
-        match &self.socket {
-            GateSocket::Loopback { socket, destination } => Ok(socket.recv(buf).await?),
-            GateSocket::UnixDomainSocket { socket } => Ok(socket.recv(buf).await?),
+    fn create_socket(
+        config: &WarpGateConfig,
+        tunnel_name: &str,
+        dest_tx: watch::Sender<Option<std::net::SocketAddr>>,
+    ) -> anyhow::Result<ApplicationSocket> {
+        match config {
+            WarpGateConfig::Loopback(config) => {
+                let ip = if config.ipv4 {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                };
+
+                let bind_addr = std::net::SocketAddr::new(ip, config.application_to_gate);
+                let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+                std_socket.set_nonblocking(true)?;
+                let socket = tokio::net::UdpSocket::from_std(std_socket)?;
+
+                tracing::info!("warp-gate {}: listening on {}", tunnel_name, bind_addr);
+
+                let fixed_destination = if let Some(port) = config.gate_to_application {
+                    let dest_addr = std::net::SocketAddr::new(ip, port);
+                    dest_tx.send_replace(Some(dest_addr));
+                    tracing::info!("warp-gate {}: fixed destination {}", tunnel_name, dest_addr);
+                    Some(dest_addr)
+                } else {
+                    None
+                };
+
+                Ok(ApplicationSocket::Loopback {
+                    socket,
+                    fixed_destination,
+                    current_destination: dest_tx,
+                })
+            }
+            WarpGateConfig::UnixDomainSocket(config) => {
+                let _ = std::fs::remove_file(&config.path);
+                let socket = tokio::net::UnixDatagram::bind(&config.path)?;
+
+                tracing::info!("warp-gate {}: using socket {}", tunnel_name, config.path.display());
+
+                Ok(ApplicationSocket::UnixDomainSocket(socket))
+            }
         }
     }
 
-    pub(crate) async fn send_to_application(&self, data: &[u8]) -> anyhow::Result<()> {
-        match &self.socket {
-            GateSocket::Loopback { socket, destination } => {
-                let sent_bytes = socket.send(data).await?;
-                match sent_bytes {
-                    bytes if bytes == data.len() => Ok(()),
-                    _ => Err(anyhow::anyhow!("send call did not send the complete buffer")),
-                }
-            }
-            GateSocket::UnixDomainSocket { socket } => {
-                let sent_bytes = socket.send(data).await?;
-                match sent_bytes {
-                    bytes if bytes == data.len() => Ok(()),
-                    _ => Err(anyhow::anyhow!("send call did not send the complete buffer")),
-                }
-            }
+    pub async fn send_to_application(&self, data: &[u8]) -> anyhow::Result<()> {
+        let fallback_destination = *self.current_destination.borrow();
+
+        let sent = self.socket.send(data, fallback_destination).await?;
+
+        if sent != data.len() {
+            return Err(anyhow::anyhow!("Partial send: {} of {} bytes", sent, data.len()));
         }
+
+        Ok(())
     }
 }
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        if let Some(task) = self.rx_task.get() {
-            task.abort()
+        if let Some(task) = self._task.get() {
+            task.abort();
         }
     }
 }

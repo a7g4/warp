@@ -1,11 +1,19 @@
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OnceCell, mpsc};
+use tokio::task::JoinHandle;
+use anyhow::Context;
 
-pub type InterfaceMap = HashMap<NetworkInterfaceIdentifier, Arc<NetworkInterface>>;
+const BUFFER_SIZE: usize = 65536;
+// TODO: Get this from config
+const DEFAULT_MTU: usize = 1300;
+// TODO: Get this from config
+const SEND_TIMEOUT_MS: u64 = 100;
+
+// TODO: Get this from config
+const MAX_CONSECUTIVE_FAILURES: usize = 10;
 
 #[derive(Debug)]
 pub struct RxPayload {
@@ -16,203 +24,229 @@ pub struct RxPayload {
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub(crate) struct NetworkInterfaceIdentifier {
+pub struct NetworkInterfaceId {
     pub name: String,
     pub ip: IpAddr,
 }
 
-impl Display for NetworkInterfaceIdentifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+impl Display for NetworkInterfaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.name, self.ip)
     }
 }
 
-pub(crate) struct NetworkInterface {
+pub struct NetworkInterface {
+    pub id: NetworkInterfaceId,
     socket: tokio::net::UdpSocket,
-    registration_task: OnceCell<tokio::task::JoinHandle<()>>,
-    rx_task: OnceCell<tokio::task::JoinHandle<()>>,
+    receiver_addr: SocketAddr,
     mtu: usize,
+
+    consecutive_failures: std::sync::atomic::AtomicUsize,
+    registration_task: OnceCell<JoinHandle<()>>,
+    receiver_task: OnceCell<JoinHandle<()>>,
 }
 
 impl NetworkInterface {
     pub fn new(
-        interface_id: &NetworkInterfaceIdentifier,
-        warp_config: &warp_config::WarpConfig,
-        rx_channel: tokio::sync::mpsc::UnboundedSender<RxPayload>,
+        id: NetworkInterfaceId,
+        config: &warp_config::WarpConfig,
+        rx_channel: mpsc::UnboundedSender<RxPayload>,
     ) -> anyhow::Result<Arc<Self>> {
-        let raw_socket = std::net::UdpSocket::bind(SocketAddr::new(interface_id.ip, 0))?;
-        raw_socket.set_nonblocking(true)?;
-        raw_socket.set_write_timeout(Some(Duration::from_millis(100)))?;
-        let tokio_socket = tokio::net::UdpSocket::from_std(raw_socket)?;
-        let receiver_address = tokio_socket.local_addr()?;
+        let bind_to_device = config.interfaces.use_bind_to_device.unwrap_or(false);
+        let socket = Self::create_socket(&id, bind_to_device)?;
+        let receiver_addr = socket.local_addr()?;
 
         let interface = Arc::new(Self {
-            socket: tokio_socket,
+            id: id.clone(),
+            socket,
+            receiver_addr,
+            mtu: DEFAULT_MTU,
+            consecutive_failures: std::sync::atomic::AtomicUsize::new(0),
             registration_task: OnceCell::new(),
-            rx_task: OnceCell::new(),
-            mtu: 1300, // TODO: Get from configuration
+            receiver_task: OnceCell::new(),
         });
 
-        // Pre-allocate shared strings
-        //let interface_name: Arc<str> = interface_id.name.clone().into();
-
-        // Registration task with proper shutdown
-        let weak_interface = Arc::downgrade(&interface);
-        let registration_task = tokio::task::Builder::new()
-            .name(&format!("warp-map registration task for {}", interface_id))
-            .spawn({
-                let interface_id = interface_id.clone();
-                let public_key = warp_config.private_key.public_key();
-                let warp_map_cipher = warp_protocol::crypto::cipher_from_shared_secret(
-                    &warp_config.private_key.clone(),
-                    &warp_config.warp_map.public_key,
-                );
-                let mut interface_scan_interval =
-                    tokio::time::interval(Duration::from_secs(warp_config.interfaces.interface_scan_interval));
-                let warp_map_addr = warp_config.warp_map.address;
-                let peer_pubkey = warp_config.far_gate.public_key;
-
-                async move {
-                    loop {
-                        interface_scan_interval.tick().await;
-                        let Some(interface) = weak_interface.upgrade() else {
-                            tracing::debug!("Interface dropped, exiting registration task");
-                            break;
-                        };
-
-                        tracing::info!("Registering interface {}", interface_id);
-
-                        // Handle errors properly instead of continue
-                        if let Err(err) = Self::send_registration_messages(
-                            &interface,
-                            &public_key,
-                            &peer_pubkey,
-                            warp_map_addr,
-                            &warp_map_cipher,
-                        )
-                        .await
-                        {
-                            tracing::error!("Registration failed for {}: {}", interface_id, err);
-                        }
-                    }
-                }
-            })?;
-
-        // Set task (this should never fail on first set)
         interface
             .registration_task
-            .set(registration_task)
-            .map_err(|_| anyhow::anyhow!("Failed to set registration task"))?;
-
-        // RX task with proper shutdown and buffer reuse
-        let weak_interface = Arc::downgrade(&interface);
-        let rx_task = tokio::task::Builder::new()
-            .name(&format!("rx task for {}", interface_id))
-            .spawn({
-                let interface_id = interface_id.clone();
-
-                async move {
-                    let mut buf = vec![0u8; 1500];
-
-                    loop {
-                        // Check if interface still exists at start of loop
-                        let Some(interface) = weak_interface.upgrade() else {
-                            tracing::debug!("Interface dropped, exiting rx task");
-                            break;
-                        };
-
-                        match interface.socket.recv_from(&mut buf).await {
-                            Err(err) => {
-                                tracing::error!("Error receiving message on {}: {}", interface_id, err);
-                            }
-                            Ok((recv_size, from)) => {
-                                let payload = RxPayload {
-                                    from,
-                                    receiver: receiver_address,
-                                    receiver_name: interface_id.name.clone(),
-                                    data: buf[..recv_size].to_vec(),
-                                };
-
-                                if let Err(err) = rx_channel.send(payload) {
-                                    tracing::error!("Error proxying message to processing queue: {}", err)
-                                }
-                            }
-                        }
-                    }
-                }
-            })?;
+            .set(Self::spawn_registration_task(interface.clone(), config)?)?;
 
         interface
-            .rx_task
-            .set(rx_task)
-            .map_err(|_| anyhow::anyhow!("Failed to set rx task"))?;
+            .receiver_task
+            .set(Self::spawn_receiver_task(interface.clone(), rx_channel)?)?;
 
         Ok(interface)
     }
 
-    // Extract registration logic for better error handling
-    async fn send_registration_messages<C>(
+    fn create_socket(interface: &NetworkInterfaceId, bind_to_device: bool) -> anyhow::Result<tokio::net::UdpSocket> {
+        let std_socket = std::net::UdpSocket::bind(SocketAddr::new(interface.ip, 0))?;
+
+        // TODO: This is an ugly hack to work around linux routing shenanigans and needs root
+        #[cfg(target_os = "linux")]
+        if bind_to_device {
+            let interface_name_cstr = std::ffi::CString::new(interface.name.clone())?;
+            unsafe {
+                let ret = libc::setsockopt(
+                    std_socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    interface_name_cstr.as_ptr() as *const libc::c_void,
+                    interface_name_cstr.as_bytes_with_nul().len() as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+        }
+
+        std_socket.set_nonblocking(true)?;
+        std_socket.set_write_timeout(Some(Duration::from_millis(SEND_TIMEOUT_MS)))?;
+        Ok(tokio::net::UdpSocket::from_std(std_socket)?)
+    }
+
+    fn spawn_registration_task(
+        interface: Arc<Self>,
+        config: &warp_config::WarpConfig,
+    ) -> anyhow::Result<JoinHandle<()>> {
+        let task = tokio::spawn({
+            let public_key = config.private_key.public_key();
+            let peer_pubkey = config.far_gate.public_key;
+            let warp_map_addr = config.warp_map.address;
+            let cipher =
+                warp_protocol::crypto::cipher_from_shared_secret(&config.private_key, &config.warp_map.public_key);
+            let mut interval = tokio::time::interval(Duration::from_secs(config.interfaces.interface_scan_interval));
+
+            async move {
+                loop {
+                    interval.tick().await;
+
+                    tracing::info!("Registering interface {}", interface.id);
+
+                    if let Err(e) =
+                        Self::register_interface(&interface, &public_key, &peer_pubkey, warp_map_addr, &cipher).await
+                    {
+                        tracing::error!("Registration failed for {}: {}", interface.id, e);
+                    }
+                }
+            }
+        });
+
+        Ok(task)
+    }
+
+    fn spawn_receiver_task(
+        interface: Arc<Self>,
+        rx_channel: mpsc::UnboundedSender<RxPayload>,
+    ) -> anyhow::Result<JoinHandle<()>> {
+        let task = tokio::spawn({
+            let receiver_addr = interface.receiver_addr;
+
+            async move {
+                let mut buf = vec![0u8; BUFFER_SIZE];
+
+                loop {
+                    match interface.socket.recv_from(&mut buf).await {
+                        Ok((size, from)) => {
+                            let payload = RxPayload {
+                                from,
+                                receiver: receiver_addr,
+                                receiver_name: interface.id.name.clone(),
+                                data: buf[..size].to_vec(),
+                            };
+
+                            if rx_channel.send(payload).is_err() {
+                                tracing::debug!("Receiver channel closed, exiting");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Receive error on {}: {}", interface.id, e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(task)
+    }
+
+    async fn register_interface<C>(
         interface: &NetworkInterface,
         public_key: &warp_protocol::PublicKey,
         peer_pubkey: &warp_protocol::PublicKey,
         warp_map_addr: SocketAddr,
         cipher: &C,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    ) -> anyhow::Result<()>
     where
         C: warp_protocol::Aead,
     {
-        let registration_msg = warp_protocol::messages::RegisterRequest {
+        let timestamp = std::time::SystemTime::now();
+
+        // Send registration
+        let registration = warp_protocol::messages::RegisterRequest {
             pubkey: *public_key,
-            timestamp: std::time::SystemTime::now(),
+            timestamp,
         };
+        interface.send_to(registration, &warp_map_addr, cipher).await?;
 
-        interface.send_to(registration_msg, &warp_map_addr, cipher).await?;
-
-        let peer_address_query = warp_protocol::messages::MappingRequest {
+        // Query peer address
+        let query = warp_protocol::messages::MappingRequest {
             peer_pubkey: *peer_pubkey,
-            timestamp: std::time::SystemTime::now(),
+            timestamp,
         };
+        interface.send_to(query, &warp_map_addr, cipher).await?;
 
-        interface.send_to(peer_address_query, &warp_map_addr, cipher).await?;
         Ok(())
     }
 
-    pub async fn send_to<M, C>(&self, message: M, address: &SocketAddr, cipher: &C) -> tokio::io::Result<usize>
+    pub async fn send_to<M, C>(&self, message: M, address: &SocketAddr, cipher: &C) -> anyhow::Result<()>
     where
         M: warp_protocol::codec::Message,
         C: warp_protocol::Aead,
     {
-        // Better error handling chain
-        let encoded = message
-            .encode()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let encrypted = encoded
-            .encrypt(cipher)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let bytes = encrypted
-            .to_bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let bytes = message.encode()?.encrypt(cipher)?.to_bytes()?;
 
         if bytes.len() > self.mtu {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Message size {} exceeds MTU {}", bytes.len(), self.mtu),
-            ));
+            return Err(anyhow::anyhow!("Message size {} exceeds MTU {}", bytes.len(), self.mtu));
         }
 
-        self.socket.send_to(&bytes, address).await
+        match self.socket.send_to(&bytes, address).await {
+            Ok(sent_bytes) if sent_bytes == bytes.len() => {
+                self.consecutive_failures.store(0, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+            Ok(sent_bytes) => {
+                self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                Err(anyhow::anyhow!(
+                "Incomplete send; attempted to send {} bytes but only sent {}",
+                bytes.len(),
+                sent_bytes
+                ))
+            },
+            Err(e) => {
+                self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                Err(e).context(format!("Failed to send {} bytes", bytes.len()))
+            },
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        println!("{}: {} consecutive failures", self.id, self.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed));
+        self.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed) < MAX_CONSECUTIVE_FAILURES
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.registration_task.get() {
+            task.abort();
+        }
+        if let Some(task) = self.receiver_task.get() {
+            task.abort();
+        }
     }
 }
 
 impl Drop for NetworkInterface {
     fn drop(&mut self) {
-        if let Some(task) = self.registration_task.get() {
-            task.abort();
-        }
-        if let Some(task) = self.rx_task.get() {
-            task.abort();
-        }
+        self.stop();
     }
 }

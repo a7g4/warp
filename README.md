@@ -17,6 +17,17 @@ The binaries `warp`, `warp-keygen`, `warp-print-example-config` and `warp-map` w
 ```
 warp-keygen
 ```
+
+This will print a private key (to be used in "this" computer's warp config) and a public key (to be used in the "peer"s
+warp config).
+
+`warp-keygen` supports generating "vanity" keys by brute force searching for keys with a specified regex pattern.
+
+<!--- TODO: Add a flag to warp-keygen to re-derive the public key from a private key --->
+(Note: the public key corresponding to the private key is printed each time `warp` is run so losing it is not an issue)
+
+Run `warp-keygen --help` for more information.
+
 2. Generate a config:
 
 ```
@@ -27,15 +38,41 @@ warp-print-example-config > config
 
 > Replace `private_key` with the private key from `warp-keygen`
 
+The keys (both public and private) are case insensitive and consist only of alphanumeric characters (similar characters
+such as `O`/`0`, `I`/`l`/`1` only have one option so they can be transcribed by hand if neccessary)
+
 > Add/remove patterns to the `exclusion_patterns` list in the `[interfaces]` section
+
+Use the array in the default configuration as a reference; regular expressions or exact matches are supported.
 
 > Set the appropriate address and public key for the warp map in the `[warp_map]` section
 
+The `warp-map` server will print out it's public key on startup if needed.
+
 > Set the appropriate public key for the peer to establish tunnels with in the `[far_gate]` section
+
+The peer will print out it's public key when `warp` starts if needed.
 
 > Set up [tunnels.*] as required
 
-Run warp:
+<!-- TODO: Update this when transport features are added --->
+Currently all the subsections (`gate`, `transport`, `transport.redundancy`) are needed however only `gate` does
+anything. See [warp_config](../warp-config/src/lib.rs) for more details.
+
+Warp supports an arbitrary number of tunnels (limited only by system/network resources). The tunnel name can be any
+[valid TOML key](https://toml.io/en/v1.0.0#keys).
+
+There are no special/magic names for tunnels.
+
+> Set `interfaces.bind_to_device` if necessary
+
+If wireguard (or some other VPN) is hijacking the default route in the routing table, it is necessary to set this to
+true. This is required even when running a wireguard-over-warp setup. This will require running warp with `CAP_NET_RAW`
+privileges (the simplest way to run with these privileges is `sudo warp ...` but as always: use sudo at your own risk).
+
+For most other setups, this field can be omitted or set to `false`.
+
+4. Run warp:
 
 ```
 warp config

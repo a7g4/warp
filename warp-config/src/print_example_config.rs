@@ -6,6 +6,7 @@ fn main() {
             .unwrap(),
         interfaces: warp_config::InterfacesConfig {
             interface_scan_interval: 10,
+            use_bind_to_device: Some(false),
             exclusion_patterns: regex::RegexSet::new(vec!["eth.*"]).unwrap(),
         },
         warp_map: warp_config::WarpMapConfig {
@@ -47,7 +48,26 @@ fn main() {
             gate: warp_config::WarpGateConfig::Loopback(warp_config::LoopbackConfig {
                 ipv4: true,
                 application_to_gate: 9000,
-                gate_to_application: 9001,
+                gate_to_application: None,
+            }),
+            transport: warp_config::WarpTransportConfig {
+                redundancy: warp_config::RedundancyConfig {
+                    num_shards: 5,
+                    required_shards: 3,
+                },
+                mtu: 1400,
+                ordered: false,
+            },
+        },
+    );
+
+    config.tunnels.insert(
+        "control_messages".to_string(),
+        warp_config::WarpTunnelConfig {
+            gate: warp_config::WarpGateConfig::Loopback(warp_config::LoopbackConfig {
+                ipv4: true,
+                application_to_gate: 9010,
+                gate_to_application: Some(9011),
             }),
             transport: warp_config::WarpTransportConfig {
                 redundancy: warp_config::RedundancyConfig {
