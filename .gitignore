@@ -1,1 +1,51 @@
-/target
+# Default ignore everything
+*
+
+# Don't ignore this .gitignore
+!.gitignore
+
+!Cargo.toml
+!Cargo.lock
+!README.md
+!rustfmt.toml
+
+
+# Whitelist .cargo and all children
+!.cargo/
+!.cargo/**/
+!.cargo/**/*
+
+# Whitelist docs and all children
+!docs/
+!docs/**/
+!docs/**/*
+
+# Whitelist warp and all children
+!warp/
+!warp/**/
+!warp/**/*
+
+# Whitelist warp-config and all children
+!warp-config/
+!warp-config/**/
+!warp-config/**/*
+
+# Whitelist warp-gf256 and all children
+!warp-gf256/
+!warp-gf256/**/
+!warp-gf256/**/*
+
+# Whitelist warp-map and all children
+!warp-map/
+!warp-map/**/
+!warp-map/**/*
+
+# Whitelist warp-protocol and all children
+!warp-protocol/
+!warp-protocol/**/
+!warp-protocol/**/*
+
+# Whitelist warp-protocol-derive and all children
+!warp-protocol-derive/
+!warp-protocol-derive/**/
+!warp-protocol-derive/**/*

@@ -13,5 +13,14 @@ k256 = { version = "~0.14.0-pre.8", features = ["serde", "ecdh"] }
 sha3 = "~0.11.0-rc.0"
 thiserror = "~2"
 rand = "~0"
+tracing = "~0"
+generic-array = "~0"
 
 warp-protocol-derive = { path = "../warp-protocol-derive" }
+
+[[bench]]
+name = "payload_encryption"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.3", features = ["html_reports"] }

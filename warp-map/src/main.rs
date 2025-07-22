@@ -66,7 +66,6 @@ impl WarpMapServer {
             let mut buf = [0; 2 << 9];
             match socket.recv_from(&mut buf).await {
                 Ok((len, address)) => {
-                    let span = tracing::span!(tracing::Level::INFO, "handle udp datagram").entered();
                     let socket_clone = socket.clone();
                     let private_key = self.private_key.clone();
                     let client_store = self.client_store.clone();
@@ -130,7 +129,7 @@ impl WarpMapServer {
 
             match decrypted.message_id {
                 warp_protocol::messages::RegisterRequest::MESSAGE_ID => {
-                    let registration_msg = warp_protocol::messages::RegisterRequest::decode(decrypted)?;
+                    let registration_msg: warp_protocol::messages::RegisterRequest = decrypted.decode()?;
 
                     {
                         let mut store = client_store.write().await;
@@ -155,7 +154,7 @@ impl WarpMapServer {
                 }
                 warp_protocol::messages::MappingRequest::MESSAGE_ID => {
                     println!("MappingRequest");
-                    let mapping_msg = warp_protocol::messages::MappingRequest::decode(decrypted)?;
+                    let mapping_msg: warp_protocol::messages::MappingRequest = decrypted.decode()?;
 
                     let addresses = {
                         let store = client_store.read().await;
@@ -186,6 +185,9 @@ impl WarpMapServer {
             if remaining_buf.is_empty() {
                 break;
             }
+
+            // Yield to allow other tasks to run
+            tokio::task::yield_now().await;
         }
         Ok(response_bytes)
     }

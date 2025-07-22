@@ -6,8 +6,9 @@ fn main() {
             .unwrap(),
         interfaces: warp_config::InterfacesConfig {
             interface_scan_interval: 10,
-            use_bind_to_device: Some(false),
+            bind_to_device: Some(false),
             exclusion_patterns: regex::RegexSet::new(vec!["eth.*"]).unwrap(),
+            max_consecutive_failures: 10,
         },
         warp_map: warp_config::WarpMapConfig {
             address: std::net::SocketAddr::from_str("1.2.3.4:13116").unwrap(),
@@ -28,6 +29,7 @@ fn main() {
     config.tunnels.insert(
         "video_streams".to_string(),
         warp_config::WarpTunnelConfig {
+            tunnel_id: None,
             gate: warp_config::WarpGateConfig::UnixDomainSocket(warp_config::UnixDomainSocketConfig {
                 path: "/tmp/socket".into(),
             }),
@@ -37,6 +39,7 @@ fn main() {
                     required_shards: 3,
                 },
                 mtu: 1400,
+                send_deadline: std::time::Duration::from_millis(10),
                 ordered: false,
             },
         },
@@ -45,6 +48,7 @@ fn main() {
     config.tunnels.insert(
         "wireguard".to_string(),
         warp_config::WarpTunnelConfig {
+            tunnel_id: Some(5),
             gate: warp_config::WarpGateConfig::Loopback(warp_config::LoopbackConfig {
                 ipv4: true,
                 application_to_gate: 9000,
@@ -56,6 +60,7 @@ fn main() {
                     required_shards: 3,
                 },
                 mtu: 1400,
+                send_deadline: std::time::Duration::from_micros(10),
                 ordered: false,
             },
         },
@@ -64,6 +69,7 @@ fn main() {
     config.tunnels.insert(
         "control_messages".to_string(),
         warp_config::WarpTunnelConfig {
+            tunnel_id: Some(42),
             gate: warp_config::WarpGateConfig::Loopback(warp_config::LoopbackConfig {
                 ipv4: true,
                 application_to_gate: 9010,
@@ -75,6 +81,7 @@ fn main() {
                     required_shards: 3,
                 },
                 mtu: 1400,
+                send_deadline: std::time::Duration::from_nanos(10),
                 ordered: false,
             },
         },

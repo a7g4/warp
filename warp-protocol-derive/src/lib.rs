@@ -9,10 +9,9 @@ pub fn derive_aead_message(input: TokenStream) -> TokenStream {
     let message_id = extract_message_id(&input.attrs);
     let name = &input.ident;
     let fields = extract_struct_fields(&input.data);
+    let fields = categorize_fields(fields);
 
-    let (public_fields, private_fields) = categorize_fields(fields);
-
-    let public_struct_name = if public_fields.is_empty() {
+    let public_struct_name = if fields.public_fields.is_empty() {
         syn::parse_str::<syn::Type>("()").unwrap()
     } else {
         let struct_name = syn::Ident::new(&format!("{}AssociatedData", name), name.span());
@@ -22,7 +21,7 @@ pub fn derive_aead_message(input: TokenStream) -> TokenStream {
         })
     };
 
-    let private_struct_name = if private_fields.is_empty() {
+    let secret_struct_name = if fields.secret_fields.is_empty() {
         syn::parse_str::<syn::Type>("()").unwrap()
     } else {
         let struct_name = syn::Ident::new(&format!("{}EncryptedData", name), name.span());
@@ -32,31 +31,25 @@ pub fn derive_aead_message(input: TokenStream) -> TokenStream {
         })
     };
 
-    let public_struct = generate_public_struct(&public_struct_name, &public_fields);
-    let private_struct = generate_private_struct(&private_struct_name, &private_fields);
-    let split_impl = generate_split_impl(
-        name,
-        &public_struct_name,
-        &public_fields,
-        &private_struct_name,
-        &private_fields,
-    );
-    let from_parts_impl = generate_from_parts_impl(
-        name,
-        &public_struct_name,
-        &public_fields,
-        &private_struct_name,
-        &private_fields,
-    );
+    let public_struct = generate_public_struct(&public_struct_name, &fields.public_fields);
+    let secret_struct = generate_secret_struct(&secret_struct_name, &fields.secret_fields);
+
+    let nonce_impl = generate_nonce_impl(&fields.nonce_field);
+    let public_bytes_impl = generate_public_bytes_impl(&public_struct_name, &fields.public_fields);
+    let secret_bytes_impl = generate_secret_bytes_impl(&secret_struct_name, &fields.secret_fields);
+
+    let from_parts_impl = generate_from_parts_impl(name, &fields);
 
     let expanded = quote! {
         #public_struct
-        #private_struct
+        #secret_struct
 
         impl crate::codec::Message for #name {
             type AssociatedData = #public_struct_name;
             const MESSAGE_ID: u8 = #message_id as u8;
-            #split_impl
+            #nonce_impl
+            #public_bytes_impl
+            #secret_bytes_impl
             #from_parts_impl
         }
     };
@@ -90,20 +83,25 @@ fn extract_struct_fields(data: &Data) -> &syn::punctuated::Punctuated<syn::Field
     }
 }
 
-type FieldInfo<'a> = (&'a syn::Ident, &'a syn::Type, &'a [Attribute]);
+type FieldInfo = (syn::Ident, syn::Type, Vec<Attribute>);
+struct FieldClassification {
+    public_fields: Vec<FieldInfo>,
+    secret_fields: Vec<FieldInfo>,
+    nonce_field: Option<FieldInfo>,
+}
 
-fn categorize_fields(
-    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
-) -> (Vec<FieldInfo>, Vec<FieldInfo>) {
+fn categorize_fields(fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>) -> FieldClassification {
     let mut public_fields = Vec::new();
-    let mut private_fields = Vec::new();
+    let mut secret_fields = Vec::new();
+    let mut nonce_field = None;
 
     for field in fields {
         let field_name = field.ident.as_ref().unwrap();
-        let field_type = &field.ty;
+        let field_type = field.ty.clone();
 
         let mut is_associated_data = false;
         let mut is_encrypted = false;
+        let mut is_nonce = false;
 
         for attr in &field.attrs {
             if attr.path().is_ident("Aead") {
@@ -114,9 +112,11 @@ fn categorize_fields(
                             is_associated_data = true;
                         } else if tokens_str == "encrypted" {
                             is_encrypted = true;
+                        } else if tokens_str == "Nonce" {
+                            is_nonce = true;
                         } else {
                             panic!(
-                                "Unknown Aead attribute option '{}' for field {}",
+                                "Unknown Aead attribute option '{}' for field {}. Valid options are: associated_data, encrypted, Nonce",
                                 tokens_str, field_name
                             );
                         }
@@ -129,22 +129,41 @@ fn categorize_fields(
             }
         }
 
-        match (is_associated_data, is_encrypted) {
-            (true, true) => panic!("Field {} cannot be both associated_data and encrypted", field_name),
-            (true, false) => public_fields.push((field_name, field_type, field.attrs.as_slice())),
-            (false, true) => private_fields.push((field_name, field_type, field.attrs.as_slice())),
-            (false, false) => panic!(
-                "Field {} must be marked as either #[Aead(associated_data)] or #[Aead(encrypted)]",
+        let count = [is_associated_data, is_encrypted, is_nonce]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+        if count > 1 {
+            panic!("Field {} cannot have multiple Aead attributes", field_name);
+        } else if count < 1 {
+            panic!(
+                "Field {} must be marked as either #[Aead(associated_data)], #[Aead(encrypted)], or #[Aead(Nonce)]",
                 field_name
-            ),
+            )
+        }
+
+        if is_associated_data {
+            public_fields.push((field_name.clone(), field_type.clone(), field.attrs.clone()));
+        }
+
+        if is_encrypted {
+            secret_fields.push((field_name.clone(), field_type.clone(), field.attrs.clone()));
+        }
+
+        if is_nonce {
+            nonce_field = Some((field_name.clone(), field_type.clone(), field.attrs.clone()));
         }
     }
 
-    if public_fields.is_empty() && private_fields.is_empty() {
-        panic!("Message must have at least one field");
+    if public_fields.is_empty() && secret_fields.is_empty() {
+        panic!("Message must have at least one field marked as associated_data or encrypted");
     }
 
-    (public_fields, private_fields)
+    FieldClassification {
+        public_fields,
+        secret_fields,
+        nonce_field,
+    }
 }
 
 fn extract_passthrough_attributes(attrs: &[Attribute]) -> Vec<proc_macro2::TokenStream> {
@@ -184,136 +203,173 @@ fn generate_public_struct(public_struct_name: &Type, public_fields: &[FieldInfo]
     }
 }
 
-fn generate_private_struct(private_struct_name: &Type, private_fields: &[FieldInfo]) -> proc_macro2::TokenStream {
-    if private_fields.is_empty() {
+fn generate_secret_struct(secret_struct_name: &Type, secret_fields: &[FieldInfo]) -> proc_macro2::TokenStream {
+    if secret_fields.is_empty() {
         return quote! {};
     }
 
-    let private_field_defs = private_fields.iter().map(|(name, ty, attrs)| {
+    let secret_field_defs = secret_fields.iter().map(|(name, ty, attrs)| {
         let passthrough_attrs = extract_passthrough_attributes(attrs);
         quote! { #(#passthrough_attrs)* pub #name: #ty }
     });
 
     quote! {
         #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
-        pub(crate) struct #private_struct_name {
-            #(#private_field_defs),*
+        pub(crate) struct #secret_struct_name {
+            #(#secret_field_defs),*
         }
     }
 }
 
-fn generate_split_impl(
-    name: &syn::Ident,
-    public_struct_name: &Type,
-    public_fields: &[FieldInfo],
-    private_struct_name: &Type,
-    private_fields: &[FieldInfo],
-) -> proc_macro2::TokenStream {
+fn generate_nonce_impl(nonce_field: &Option<FieldInfo>) -> proc_macro2::TokenStream {
+    if let Some((nonce_name, nonce_type, _)) = nonce_field {
+        // Generate specific implementations for known types
+        if let syn::Type::Path(type_path) = nonce_type {
+            if let Some(ident) = type_path.path.get_ident() {
+                if ident == "u64" {
+                    return quote! {
+                        fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
+                        where
+                            F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+                        {
+                            let nonce_bytes = self.#nonce_name.to_le_bytes();
+                            f(&nonce_bytes)?;
+                            Ok(true)
+                        }
+                    };
+                } else if ident == "u32" {
+                    return quote! {
+                        fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
+                        where
+                            F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+                        {
+                            let nonce_bytes = self.#nonce_name.to_le_bytes();
+                            f(&nonce_bytes)?;
+                            Ok(true)
+                        }
+                    };
+                }
+            }
+        }
+
+        // Fallback for other types using the Nonceable trait
+        quote! {
+            fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
+            where
+                F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+            {
+                use crate::codec::Nonceable;
+                let nonce_bytes = self.#nonce_name.as_nonce_bytes();
+                f(nonce_bytes.as_ref())?;
+                Ok(true)
+            }
+        }
+    } else {
+        quote! {
+            fn with_nonce_bytes<F, R>(&self, _f: F) -> Result<bool, crate::EncodeError>
+            where
+                F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+            {
+                // No custom nonce, so don't call the function and return false
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn generate_public_bytes_impl(public_struct_name: &Type, public_fields: &[FieldInfo]) -> proc_macro2::TokenStream {
     let public_data = if !public_fields.is_empty() {
         let field_assignments = public_fields.iter().map(|(name, _, _)| {
-            quote! { #name: self.#name }
+            quote! { #name: self.#name.clone() }
         });
         quote! {
             let public_data = #public_struct_name { #(#field_assignments),* };
-            let public_bytes = bincode::encode_to_vec(&public_data, bincode::config::standard())?;
+            let public_bytes = bincode::encode_to_vec(&public_data, crate::BINCODE_CONFIG)?;
         }
     } else {
         quote! { let public_bytes : Vec<u8> = Vec::new(); }
     };
 
-    let private_data = if !private_fields.is_empty() {
-        let field_assignments = private_fields.iter().map(|(name, _, _)| {
-            quote! { #name: self.#name }
-        });
-        quote! {
-            let private_data = #private_struct_name { #(#field_assignments),* };
-            let private_bytes = bincode::encode_to_vec(&private_data, bincode::config::standard())?;
-        }
-    } else {
-        quote! { let private_bytes : Vec<u8> = Vec::new(); }
-    };
-
-    let message_parts = match (public_fields.is_empty(), private_fields.is_empty()) {
-        (true, false) => quote! { crate::codec::MessageParts::PrivateOnly(private_bytes) },
-        (false, true) => quote! { crate::codec::MessageParts::PublicOnly(public_bytes) },
-        (false, false) => quote! {
-            crate::codec::MessageParts::Both {
-                public: public_bytes,
-                private: private_bytes
-            }
-        },
-        (true, true) => unreachable!(),
-    };
-
     quote! {
-        fn split(self) -> Result<crate::codec::MessageParts, crate::EncodeError> {
+        fn public_bytes(&self) -> Result<Vec<u8>, crate::EncodeError> {
             #public_data
-            #private_data
-            Ok(#message_parts)
+            Ok(public_bytes)
         }
     }
 }
 
-fn generate_from_parts_impl(
-    name: &syn::Ident,
-    public_struct_name: &Type,
-    public_fields: &[FieldInfo],
-    private_struct_name: &Type,
-    private_fields: &[FieldInfo],
-) -> proc_macro2::TokenStream {
-    match (public_fields.is_empty(), private_fields.is_empty()) {
-        (true, false) => {
-            let field_assignments = private_fields.iter().map(|(name, _, _)| {
-                quote! { #name: private_data.#name }
-            });
-            quote! {
-                fn from_parts(parts: crate::codec::MessageParts) -> Result<Self, crate::DecodeError> {
-                    match parts {
-                        crate::codec::MessageParts::PrivateOnly(private) => {
-                            let private_data: #private_struct_name = bincode::decode_from_slice(&private, bincode::config::standard())?.0;
-                            Ok(Self { #(#field_assignments),* })
-                        },
-                        _ => Err(crate::DecodeError::InvalidMessageFormat),
-                    }
-                }
-            }
+fn generate_secret_bytes_impl(secret_struct_name: &Type, secret_fields: &[FieldInfo]) -> proc_macro2::TokenStream {
+    let secret_data = if !secret_fields.is_empty() {
+        let field_assignments = secret_fields.iter().map(|(name, _, _)| {
+            quote! { #name: self.#name.clone() }
+        });
+        quote! {
+            let secret_data = #secret_struct_name { #(#field_assignments),* };
+            let secret_bytes = bincode::encode_to_vec(&secret_data, crate::BINCODE_CONFIG)?;
         }
-        (false, true) => {
-            let field_assignments = public_fields.iter().map(|(name, _, _)| {
+    } else {
+        quote! { let secret_bytes : Vec<u8> = Vec::new(); }
+    };
+
+    quote! {
+        fn secret_bytes(&self) -> Result<Vec<u8>, crate::EncodeError> {
+            #secret_data
+            Ok(secret_bytes)
+        }
+    }
+}
+
+fn generate_from_parts_impl(name: &syn::Ident, fields: &FieldClassification) -> proc_macro2::TokenStream {
+    let public_decode = if !fields.public_fields.is_empty() {
+        let public_struct_name = syn::Ident::new(&format!("{}AssociatedData", name), name.span());
+        quote! {
+            let public_data: #public_struct_name = {
+                let (decoded, _): (#public_struct_name, usize) = bincode::decode_from_slice(public_bytes, crate::BINCODE_CONFIG).unwrap();
+                decoded
+            };
+        }
+    } else {
+        quote! {}
+    };
+
+    let secret_decode = if !fields.secret_fields.is_empty() {
+        let secret_struct_name = syn::Ident::new(&format!("{}EncryptedData", name), name.span());
+        quote! {
+            let secret_data: #secret_struct_name = {
+                let (decoded, _): (#secret_struct_name, usize) = bincode::decode_from_slice(secret_bytes, crate::BINCODE_CONFIG).unwrap();
+                decoded
+            };
+        }
+    } else {
+        quote! {}
+    };
+
+    let field_assignments = fields
+        .public_fields
+        .iter()
+        .chain(fields.secret_fields.iter())
+        .map(|(name, _, _)| {
+            if fields.public_fields.iter().any(|(pub_name, _, _)| pub_name == name) {
                 quote! { #name: public_data.#name }
-            });
-            quote! {
-                fn from_parts(parts: crate::codec::MessageParts) -> Result<Self, crate::DecodeError> {
-                    match parts {
-                        crate::codec::MessageParts::PublicOnly(public) => {
-                            let public_data: #public_struct_name = bincode::decode_from_slice(&public, bincode::config::standard())?.0;
-                            Ok(Self { #(#field_assignments),* })
-                        },
-                        _ => Err(crate::DecodeError::InvalidMessageFormat),
-                    }
-                }
+            } else {
+                quote! { #name: secret_data.#name }
+            }
+        });
+
+    let nonce_assignment = if let Some((nonce_name, _, _)) = &fields.nonce_field {
+        quote! { #nonce_name: Default::default(), }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        fn from_parts(_nonce: &[u8; crate::codec::NONCE_SIZE], public_bytes: &[u8], secret_bytes: &[u8]) -> Self {
+            #public_decode
+            #secret_decode
+            Self {
+                #(#field_assignments,)*
+                #nonce_assignment
             }
         }
-        (false, false) => {
-            let pub_assigns = public_fields.iter().map(|(name, _, _)| {
-                quote! { #name: public_data.#name }
-            });
-            let priv_assigns = private_fields.iter().map(|(name, _, _)| {
-                quote! { #name: private_data.#name }
-            });
-            quote! {
-                fn from_parts(parts: crate::codec::MessageParts) -> Result<Self, crate::DecodeError> {
-                    match parts {
-                        crate::codec::MessageParts::Both { public, private } => {
-                            let public_data: #public_struct_name = bincode::decode_from_slice(&public, bincode::config::standard())?.0;
-                            let private_data: #private_struct_name = bincode::decode_from_slice(&private, bincode::config::standard())?.0;
-                            Ok(Self { #(#pub_assigns,)* #(#priv_assigns,)* })
-                        },
-                        _ => Err(crate::DecodeError::InvalidMessageFormat),
-                    }
-                }
-            }
-        }
-        (true, true) => unreachable!(),
     }
 }

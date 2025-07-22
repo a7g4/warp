@@ -1,6 +1,3 @@
-use chacha20poly1305::KeyInit;
-use sha3::Digest;
-
 pub fn pubkey_to_string(pubkey: &crate::PublicKey) -> String {
     base32::encode(base32::Alphabet::Crockford, &pubkey.to_sec1_bytes())
 }
@@ -20,24 +17,23 @@ pub fn privkey_from_string(key: &str) -> Result<crate::PrivateKey, crate::Decode
     Ok(crate::PrivateKey::from_slice(&bytes)?)
 }
 
-pub fn cipher_from_shared_secret(
-    private_key: &k256::SecretKey,
-    peer_pubkey: &k256::PublicKey,
-) -> chacha20poly1305::ChaCha20Poly1305 {
+pub fn cipher_from_shared_secret(private_key: &crate::PrivateKey, peer_pubkey: &crate::PublicKey) -> crate::Cipher {
+    use aead::KeyInit;
+    use sha3::Digest;
     let shared_secret =
         k256::elliptic_curve::ecdh::diffie_hellman(private_key.to_nonzero_scalar(), peer_pubkey.as_affine());
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(shared_secret.raw_secret_bytes().as_slice());
     let key = hasher.finalize();
-    let cipher = chacha20poly1305::ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key.as_slice()));
-    cipher
+    
+    crate::Cipher::new(&aead::Key::<crate::Cipher>::from(key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    
     use aead::{Aead, AeadCore, Payload};
-    use chacha20poly1305::ChaCha20Poly1305;
 
     #[test]
     fn test_shared_secret() {
@@ -49,7 +45,7 @@ mod tests {
         let cipher_1 = cipher_from_shared_secret(&key_1, &key_2.public_key());
         let cipher_2 = cipher_from_shared_secret(&key_2, &key_1.public_key());
 
-        let nonce = ChaCha20Poly1305::generate_nonce()
+        let nonce = crate::Cipher::generate_nonce()
             .map_err(|_| crate::EncodeError::Encryption)
             .unwrap();
 

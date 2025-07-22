@@ -11,11 +11,7 @@ Warp is built around providing the "warp gate" abstraction. Applications can sen
 as if it was the remote endpoint that it was designed to communicate with and with no changes to the application, the
 data transport will benefit from the aggregation and redundancy of the warp tunnel.
 
-
 ![alt text](warp-tunnel.svg "Figure 1. Warp Tunnel")
-
-In this figure, red boxes represent components running on one computer; green boxes represent components running on
-a separate computer.
 
 <!--- TODO: Update this when warp does something smarter  --->
 The warp tunnel will replicate traffic that it receives from the application so that every local interface will send
@@ -43,4 +39,4 @@ The `send()` syscall in the application will block until that particular payload
 
 All instances of warp are identified by their public key. While running, warp will periodically update the warp map with
 all interfaces that it can use to send & receive as well as querying the warp map for details about the peer it is
-establishing warp tunnels with.
+establishing warp tunnels with. The frequency of this is controlled by the client's `interface_scan_interval` config.

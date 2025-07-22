@@ -6,6 +6,9 @@ pub use aead::Aead;
 
 pub type PrivateKey = k256::SecretKey;
 pub type PublicKey = k256::PublicKey;
+pub type Cipher = chacha20poly1305::ChaCha20Poly1305;
+
+pub const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -39,6 +42,4 @@ pub enum DecodeError {
     UnexpectedMessageId(u8),
     #[error("Unknown message ID: {0}")]
     UnknownMessageId(u8),
-    #[error("Invalid protocol magic")]
-    InvalidMagic,
 }

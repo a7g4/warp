@@ -6,7 +6,9 @@ setup to warp.
 ![alt text](wireguard-over-warp.svg "Figure 1. Wireguard Over Warp")
 
 Warp adds the ability to hole-punch wireguard connections which allows us to establish a wireguard connection between
-the vehicle and operator station when both of them may have dynamic IP addresses and be behind NAT firewalls.
+the vehicle and operator station when both of them may have dynamic IP addresses and be behind NAT firewalls. For
+comparison, a wireguard "server" (ie. configured with a listen address) needs it's listen port to be publicly
+accessible for a "client" behind NAT to communicate with it.
 
 ## Long term plan
 
@@ -21,7 +23,7 @@ entirely with warp. This is for a few reasons:
 
 Unix domain sockets:
 
-- Block the sender until their data has been read
+- Block the sender until their data has been processed (by the network interface or any other bottleneck)
 - Have extremely large MTUs (effectively unlimited)
 - Avoid a trip through the IP stack
 
@@ -46,17 +48,18 @@ marked with the attribute `#[Aead(associated_data)]` instead of `#[Aead(encrypte
 ![alt text](warp-direct-reason.svg "Figure 2. Comparison of Warp IPC options")
 
 In this figure:
- - Userspace to kernal mode (or vice-versa) transfers are drawn with red arrows
+ - Userspace to kernel mode (or vice-versa) transfers are drawn with red arrows
  - Userspace components are unshaded
  - Kernel mode components are shaded in pink
- - Wireguard is hatched as it may be user mode or kernal mode depending on the platform
+ - Wireguard is hatched as it may be user mode or kernel mode depending on the platform
 
 ## No server/client roles
 
 All warp instances are "clients" and coordinate with the warp-map to establish how to listen for and send traffic.
 
 As a result, the corresponding wireguard configuration will need to specify an `Endpoint` which matches the
-`application_to_gate` port of a warp tunnel.
+`application_to_gate` port of a warp tunnel (`gate_to_application` can be omitted as warp will send return traffic
+back to wherever it originated from).
 
 There is no need to specify a listen address for any of the wireguard peers.
 

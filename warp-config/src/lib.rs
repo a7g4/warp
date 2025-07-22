@@ -20,7 +20,6 @@ fn serialize_private_key<S>(private_key: &warp_protocol::PrivateKey, serializer:
 where
     S: serde::Serializer,
 {
-    // Get the patterns as strings from the RegexSet
     let string = warp_protocol::crypto::privkey_to_string(private_key);
     string.serialize(serializer)
 }
@@ -32,11 +31,11 @@ where
     let string = String::deserialize(deserializer)?;
     warp_protocol::crypto::privkey_from_string(&string).map_err(serde::de::Error::custom)
 }
+
 fn serialize_public_key<S>(private_key: &warp_protocol::PublicKey, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    // Get the patterns as strings from the RegexSet
     let string = warp_protocol::crypto::pubkey_to_string(private_key);
     string.serialize(serializer)
 }
@@ -52,12 +51,13 @@ where
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InterfacesConfig {
     pub interface_scan_interval: u64,
-    pub use_bind_to_device: Option<bool>,
+    pub bind_to_device: Option<bool>,
     #[serde(
         serialize_with = "serialize_interface_exclusions",
         deserialize_with = "deserialize_interface_exclusions"
     )]
     pub exclusion_patterns: regex::RegexSet,
+    pub max_consecutive_failures: usize,
 }
 
 fn serialize_interface_exclusions<S>(regex_set: &RegexSet, serializer: S) -> Result<S::Ok, S::Error>
@@ -114,6 +114,8 @@ where
 pub struct WarpTunnelConfig {
     pub gate: WarpGateConfig,
     pub transport: WarpTransportConfig,
+    // If tunnel_id is not set, it's string name will be used instead in the transport protocol
+    pub tunnel_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -143,11 +145,29 @@ pub struct WarpFarGateConfig {
     pub public_key: warp_protocol::PublicKey,
 }
 
+fn serialize_duration<S>(duration: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    duration.as_secs_f64().serialize(serializer)
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    f64::deserialize(deserializer).map(std::time::Duration::from_secs_f64)
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WarpTransportConfig {
     pub redundancy: RedundancyConfig,
     pub mtu: u16,
     pub ordered: bool,
+
+    // TODO: Make this support values like "100us"/"100ns"/"100ms" etc.
+    #[serde(serialize_with = "serialize_duration", deserialize_with = "deserialize_duration")]
+    pub send_deadline: std::time::Duration,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

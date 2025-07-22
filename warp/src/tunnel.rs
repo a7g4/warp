@@ -15,12 +15,8 @@ enum ApplicationSocket {
 }
 
 impl ApplicationSocket {
-    async fn recv_and_forward(
-        &self,
-        buf: &mut [u8],
-        tx_channel: &mpsc::UnboundedSender<Vec<u8>>,
-    ) -> anyhow::Result<()> {
-        let size: anyhow::Result<usize> = match self {
+    async fn recv_from_application<'a>(&self, buf: &'a mut [u8]) -> anyhow::Result<&'a [u8]> {
+        let size = match self {
             Self::Loopback {
                 socket,
                 fixed_destination,
@@ -33,18 +29,21 @@ impl ApplicationSocket {
                     current_destination.send_replace(Some(addr));
                 }
 
-                Ok(size)
+                size
             }
             Self::UnixDomainSocket(socket) => {
-                let size = socket.recv(buf).await?;
-                Ok(size)
+                
+                socket.recv(buf).await?
             }
         };
-
-        Ok(tx_channel.send(buf[..size?].to_vec())?)
+        Ok(&buf[..size])
     }
 
-    async fn send(&self, data: &[u8], fallback_addr: Option<std::net::SocketAddr>) -> anyhow::Result<usize> {
+    async fn send_to_application(
+        &self,
+        data: &[u8],
+        fallback_addr: Option<std::net::SocketAddr>,
+    ) -> anyhow::Result<usize> {
         match self {
             Self::Loopback {
                 socket,
@@ -60,47 +59,145 @@ impl ApplicationSocket {
     }
 }
 
+pub struct OutboundTunnelPayload {
+    pub tunnel_payload: warp_protocol::messages::TunnelPayload,
+    pub deadline: std::time::Instant,
+}
+
 pub struct Gate {
-    pub(crate) tunnel_name: String,
-    socket: Arc<ApplicationSocket>,
-    current_destination: watch::Receiver<Option<std::net::SocketAddr>>,
-    _task: OnceCell<JoinHandle<()>>,
+    application_inbound_channel: mpsc::UnboundedSender<warp_protocol::messages::TunnelPayload>,
+    application_listener_task: OnceCell<JoinHandle<()>>,
+    application_sender_task: OnceCell<JoinHandle<()>>,
 }
 
 impl Gate {
     pub fn new(
         tunnel_name: &str,
+        tunnel_id: warp_protocol::messages::TunnelId,
         config: WarpGateConfig,
-        tx_channel: mpsc::UnboundedSender<Vec<u8>>,
+        send_deadline: std::time::Duration,
+        application_outbound_channel: mpsc::UnboundedSender<OutboundTunnelPayload>,
     ) -> anyhow::Result<Arc<Self>> {
-        let (dest_tx, dest_rx) = watch::channel(None);
+        let (destination_announce, destination_watch) = watch::channel(None);
 
-        let socket = Self::create_socket(&config, tunnel_name, dest_tx)?;
+        let socket = Self::create_socket(&config, tunnel_name, destination_announce)?;
         let socket = Arc::new(socket);
 
+        let (application_inbound_channel, mut application_inbound_channel_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let gate = Arc::new(Self {
-            tunnel_name: tunnel_name.to_string(),
-            socket: socket.clone(),
-            current_destination: dest_rx,
-            _task: OnceCell::new(),
+            application_inbound_channel,
+            application_listener_task: OnceCell::new(),
+            application_sender_task: OnceCell::new(),
         });
 
-        let task = tokio::task::Builder::new()
-            .name(&format!("warp-gate {}: application listener", tunnel_name))
+        let application_listener_task = tokio::task::Builder::new()
+            .name(&format!("warp-gate {}: application to gate listener", tunnel_name))
             .spawn({
+                let tracer_generator = std::sync::atomic::AtomicU64::new(0);
                 let tunnel_name = tunnel_name.to_string();
                 let socket = socket.clone();
                 async move {
                     let mut buf = vec![0u8; BUFFER_SIZE];
                     loop {
-                        if let Err(e) = socket.recv_and_forward(&mut buf, &tx_channel).await {
-                            tracing::error!("warp-gate {}: recv error: {}", tunnel_name, e);
+                        match socket.recv_from_application(&mut buf).await {
+                            Ok(data) => {
+                                let tunnel_payload = warp_protocol::messages::TunnelPayload::new(
+                                    tunnel_id.clone(),
+                                    tracer_generator.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                    data.to_vec(),
+                                );
+                                let outbound = OutboundTunnelPayload {
+                                    tunnel_payload,
+                                    deadline: std::time::Instant::now() + send_deadline,
+                                };
+                                tracing::event!(
+                                    tracing::Level::DEBUG,
+                                    tunnel_name = tunnel_name,
+                                    tracer = outbound.tunnel_payload.tracer,
+                                    payload_size = outbound.tunnel_payload.data.len(),
+                                    "APPLICATION_TO_GATE_DATA_RX"
+                                );
+                                application_outbound_channel
+                                    .send(outbound)
+                                    .expect("Channel should be open");
+                            }
+                            Err(e) => {
+                                tracing::event!(
+                                    tracing::Level::WARN,
+                                    tunnel_name = tunnel_name,
+                                    error = %e,
+                                    "APPLICATION_TO_GATE_DATA_RX_ERROR"
+                                );
+                            }
                         }
+
+                        #[cfg(feature = "manual_yields")]
+                        tokio::task::yield_now().await;
                     }
                 }
             })?;
+        gate.application_listener_task
+            .set(application_listener_task)
+            .expect("application_listener_task should not have been set");
 
-        gate._task.set(task).map_err(|_| anyhow::anyhow!("Task already set"))?;
+        let application_sender_task = tokio::task::Builder::new()
+            .name(&format!("warp-gate {}: gate to application tx", tunnel_name))
+            .spawn({
+                let tunnel_name = tunnel_name.to_string();
+                let socket = socket.clone();
+                let destination_watch = destination_watch.clone();
+                async move {
+                    while let Some(tunnel_payload) = application_inbound_channel_rx.recv().await {
+                        let fallback_destination = *destination_watch.borrow();
+                        let queue_length = application_inbound_channel_rx.len();
+
+                        match socket
+                            .send_to_application(&tunnel_payload.data, fallback_destination)
+                            .await
+                        {
+                            Ok(sent) if sent == tunnel_payload.data.len() => {
+                                tracing::event!(
+                                    tracing::Level::DEBUG,
+                                    tunnel_name = tunnel_name,
+                                    tracer = tunnel_payload.tracer,
+                                    payload_size = tunnel_payload.data.len(),
+                                    queue_length = queue_length,
+                                    "GATE_TO_APPLICATION_DATA_SUCCESS"
+                                );
+                            }
+                            Ok(sent) => {
+                                tracing::event!(
+                                    tracing::Level::WARN,
+                                    tunnel_name = tunnel_name,
+                                    tracer = tunnel_payload.tracer,
+                                    payload_size = tunnel_payload.data.len(),
+                                    sent_bytes = sent,
+                                    queue_length = queue_length,
+                                    "GATE_TO_APPLICATION_DATA_INCOMPLETE"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::event!(
+                                    tracing::Level::WARN,
+                                    tunnel_name = tunnel_name,
+                                    tracer = tunnel_payload.tracer,
+                                    payload_size = tunnel_payload.data.len(),
+                                    queue_length = queue_length,
+                                    error = %e,
+                                    "GATE_TO_APPLICATION_DATA_FAILED"
+                                );
+                            }
+                        }
+                        #[cfg(feature = "manual_yields")]
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })?;
+        gate.application_sender_task
+            .set(application_sender_task)
+            .expect("application_sender_task should not have been set");
+
         Ok(gate)
     }
 
@@ -122,12 +219,16 @@ impl Gate {
                 std_socket.set_nonblocking(true)?;
                 let socket = tokio::net::UdpSocket::from_std(std_socket)?;
 
-                tracing::info!("warp-gate {}: listening on {}", tunnel_name, bind_addr);
+                tracing::info!(
+                    "warp-gate {}: listening for application data at {}",
+                    tunnel_name,
+                    bind_addr
+                );
 
                 let fixed_destination = if let Some(port) = config.gate_to_application {
                     let dest_addr = std::net::SocketAddr::new(ip, port);
                     dest_tx.send_replace(Some(dest_addr));
-                    tracing::info!("warp-gate {}: fixed destination {}", tunnel_name, dest_addr);
+                    tracing::info!("warp-gate {}: sending application data to {}", tunnel_name, dest_addr);
                     Some(dest_addr)
                 } else {
                     None
@@ -143,29 +244,28 @@ impl Gate {
                 let _ = std::fs::remove_file(&config.path);
                 let socket = tokio::net::UnixDatagram::bind(&config.path)?;
 
-                tracing::info!("warp-gate {}: using socket {}", tunnel_name, config.path.display());
+                tracing::info!(
+                    "warp-gate {}: communicating with application over socket {}",
+                    tunnel_name,
+                    config.path.display()
+                );
 
                 Ok(ApplicationSocket::UnixDomainSocket(socket))
             }
         }
     }
 
-    pub async fn send_to_application(&self, data: &[u8]) -> anyhow::Result<()> {
-        let fallback_destination = *self.current_destination.borrow();
-
-        let sent = self.socket.send(data, fallback_destination).await?;
-
-        if sent != data.len() {
-            return Err(anyhow::anyhow!("Partial send: {} of {} bytes", sent, data.len()));
-        }
-
-        Ok(())
+    pub async fn send_to_application(&self, tunnel_payload: warp_protocol::messages::TunnelPayload) {
+        self.application_inbound_channel.send(tunnel_payload).unwrap();
     }
 }
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        if let Some(task) = self._task.get() {
+        if let Some(task) = self.application_listener_task.get() {
+            task.abort();
+        }
+        if let Some(task) = self.application_sender_task.get() {
             task.abort();
         }
     }
