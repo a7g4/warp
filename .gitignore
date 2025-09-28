@@ -30,6 +30,11 @@
 !warp-config/**/
 !warp-config/**/*
 
+# Whitelist warp-gauge and all children
+!warp-gauge/
+!warp-gauge/**/
+!warp-gauge/**/*
+
 # Whitelist warp-gf256 and all children
 !warp-gf256/
 !warp-gf256/**/

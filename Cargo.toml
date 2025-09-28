@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "warp",
+    "warp-gauge",
     "warp-config",
     "warp-gf256",
     "warp-map",
