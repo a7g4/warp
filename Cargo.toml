@@ -4,6 +4,7 @@ members = [
     "warp-config",
     "warp-gf256",
     "warp-map",
+    "warp-mpscpq",
     "warp-protocol",
     "warp-protocol-derive",
 ]

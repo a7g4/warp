@@ -40,6 +40,11 @@
 !warp-map/**/
 !warp-map/**/*
 
+# Whitelist warp-mpscpq and all children
+!warp-mpscpq/
+!warp-mpscpq/**/
+!warp-mpscpq/**/*
+
 # Whitelist warp-protocol and all children
 !warp-protocol/
 !warp-protocol/**/
