@@ -14,7 +14,7 @@ pub fn derive_aead_message(input: TokenStream) -> TokenStream {
     let public_struct_name = if fields.public_fields.is_empty() {
         syn::parse_str::<syn::Type>("()").unwrap()
     } else {
-        let struct_name = syn::Ident::new(&format!("{}AssociatedData", name), name.span());
+        let struct_name = syn::Ident::new(&format!("{name}AssociatedData"), name.span());
         syn::Type::Path(syn::TypePath {
             qself: None,
             path: struct_name.into(),
@@ -24,7 +24,7 @@ pub fn derive_aead_message(input: TokenStream) -> TokenStream {
     let secret_struct_name = if fields.secret_fields.is_empty() {
         syn::parse_str::<syn::Type>("()").unwrap()
     } else {
-        let struct_name = syn::Ident::new(&format!("{}EncryptedData", name), name.span());
+        let struct_name = syn::Ident::new(&format!("{name}EncryptedData"), name.span());
         syn::Type::Path(syn::TypePath {
             qself: None,
             path: struct_name.into(),
@@ -116,15 +116,11 @@ fn categorize_fields(fields: &syn::punctuated::Punctuated<syn::Field, syn::token
                             is_nonce = true;
                         } else {
                             panic!(
-                                "Unknown Aead attribute option '{}' for field {}. Valid options are: associated_data, encrypted, Nonce",
-                                tokens_str, field_name
+                                "Unknown Aead attribute option '{tokens_str}' for field {field_name}. Valid options are: associated_data, encrypted, Nonce"
                             );
                         }
                     }
-                    _ => panic!(
-                        "Aead attribute must be used as #[Aead(option)] for field {}",
-                        field_name
-                    ),
+                    _ => panic!("Aead attribute must be used as #[Aead(option)] for field {field_name}"),
                 }
             }
         }
@@ -134,11 +130,10 @@ fn categorize_fields(fields: &syn::punctuated::Punctuated<syn::Field, syn::token
             .filter(|&&x| x)
             .count();
         if count > 1 {
-            panic!("Field {} cannot have multiple Aead attributes", field_name);
+            panic!("Field {field_name} cannot have multiple Aead attributes");
         } else if count < 1 {
             panic!(
-                "Field {} must be marked as either #[Aead(associated_data)], #[Aead(encrypted)], or #[Aead(Nonce)]",
-                field_name
+                "Field {field_name} must be marked as either #[Aead(associated_data)], #[Aead(encrypted)], or #[Aead(Nonce)]"
             )
         }
 
@@ -224,31 +219,31 @@ fn generate_secret_struct(secret_struct_name: &Type, secret_fields: &[FieldInfo]
 fn generate_nonce_impl(nonce_field: &Option<FieldInfo>) -> proc_macro2::TokenStream {
     if let Some((nonce_name, nonce_type, _)) = nonce_field {
         // Generate specific implementations for known types
-        if let syn::Type::Path(type_path) = nonce_type {
-            if let Some(ident) = type_path.path.get_ident() {
-                if ident == "u64" {
-                    return quote! {
-                        fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
-                        where
-                            F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
-                        {
-                            let nonce_bytes = self.#nonce_name.to_le_bytes();
-                            f(&nonce_bytes)?;
-                            Ok(true)
-                        }
-                    };
-                } else if ident == "u32" {
-                    return quote! {
-                        fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
-                        where
-                            F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
-                        {
-                            let nonce_bytes = self.#nonce_name.to_le_bytes();
-                            f(&nonce_bytes)?;
-                            Ok(true)
-                        }
-                    };
-                }
+        if let syn::Type::Path(type_path) = nonce_type
+            && let Some(ident) = type_path.path.get_ident()
+        {
+            if ident == "u64" {
+                return quote! {
+                    fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
+                    where
+                        F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+                    {
+                        let nonce_bytes = self.#nonce_name.to_le_bytes();
+                        f(&nonce_bytes)?;
+                        Ok(true)
+                    }
+                };
+            } else if ident == "u32" {
+                return quote! {
+                    fn with_nonce_bytes<F, R>(&self, f: F) -> Result<bool, crate::EncodeError>
+                    where
+                        F: FnOnce(&[u8]) -> Result<R, crate::EncodeError>,
+                    {
+                        let nonce_bytes = self.#nonce_name.to_le_bytes();
+                        f(&nonce_bytes)?;
+                        Ok(true)
+                    }
+                };
             }
         }
 
@@ -321,7 +316,7 @@ fn generate_secret_bytes_impl(secret_struct_name: &Type, secret_fields: &[FieldI
 
 fn generate_from_parts_impl(name: &syn::Ident, fields: &FieldClassification) -> proc_macro2::TokenStream {
     let public_decode = if !fields.public_fields.is_empty() {
-        let public_struct_name = syn::Ident::new(&format!("{}AssociatedData", name), name.span());
+        let public_struct_name = syn::Ident::new(&format!("{name}AssociatedData"), name.span());
         quote! {
             let public_data: #public_struct_name = {
                 let (decoded, _): (#public_struct_name, usize) = bincode::decode_from_slice(public_bytes, crate::BINCODE_CONFIG).unwrap();
@@ -333,7 +328,7 @@ fn generate_from_parts_impl(name: &syn::Ident, fields: &FieldClassification) -> 
     };
 
     let secret_decode = if !fields.secret_fields.is_empty() {
-        let secret_struct_name = syn::Ident::new(&format!("{}EncryptedData", name), name.span());
+        let secret_struct_name = syn::Ident::new(&format!("{name}EncryptedData"), name.span());
         quote! {
             let secret_data: #secret_struct_name = {
                 let (decoded, _): (#secret_struct_name, usize) = bincode::decode_from_slice(secret_bytes, crate::BINCODE_CONFIG).unwrap();
@@ -356,8 +351,62 @@ fn generate_from_parts_impl(name: &syn::Ident, fields: &FieldClassification) -> 
             }
         });
 
-    let nonce_assignment = if let Some((nonce_name, _, _)) = &fields.nonce_field {
-        quote! { #nonce_name: Default::default(), }
+    let nonce_assignment = if let Some((nonce_name, nonce_type, _)) = &fields.nonce_field {
+        // Generate code to extract the nonce value from the nonce bytes
+        if let syn::Type::Path(type_path) = nonce_type {
+            if let Some(ident) = type_path.path.get_ident() {
+                if ident == "u64" {
+                    quote! {
+                        #nonce_name: {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&_nonce[..8]);
+                            u64::from_le_bytes(bytes)
+                        },
+                    }
+                } else if ident == "u32" {
+                    quote! {
+                        #nonce_name: {
+                            let mut bytes = [0u8; 4];
+                            bytes.copy_from_slice(&_nonce[..4]);
+                            u32::from_le_bytes(bytes)
+                        },
+                    }
+                } else {
+                    // Fallback for other types using the Nonceable trait
+                    quote! {
+                        #nonce_name: {
+                            use crate::codec::Nonceable;
+                            let mut bytes = [0u8; std::mem::size_of::<#nonce_type>()];
+                            let len = bytes.len().min(_nonce.len());
+                            bytes[..len].copy_from_slice(&_nonce[..len]);
+                            <#nonce_type as crate::codec::Nonceable>::from_nonce_bytes(bytes)
+                        },
+                    }
+                }
+            } else {
+                // Fallback for complex types
+                quote! {
+                    #nonce_name: {
+                        use crate::codec::Nonceable;
+                        let mut bytes = [0u8; std::mem::size_of::<#nonce_type>()];
+                        let len = bytes.len().min(_nonce.len());
+                        bytes[..len].copy_from_slice(&_nonce[..len]);
+                        <#nonce_type as crate::codec::Nonceable>::from_nonce_bytes(bytes)
+                    },
+                }
+            }
+        } else {
+            // Fallback for non-path types
+            quote! {
+                #nonce_name: {
+                    use crate::codec::Nonceable;
+                    let mut bytes = [0u8; std::mem::size_of::<#nonce_type>()];
+                    let len = bytes.len().min(_nonce.len());
+                    bytes[..len].copy_from_slice(&_nonce[..len]);
+                    <#nonce_type as crate::codec::Nonceable>::from_nonce_bytes(bytes)
+                },
+            }
+        }
     } else {
         quote! {}
     };

@@ -14,15 +14,21 @@ mod tunnel;
 struct Args {
     #[arg()]
     warp_config_path: PathBuf,
+
+    #[arg(short, long, default_value_t = tracing_subscriber::filter::LevelFilter::INFO)]
+    verbosity: tracing_subscriber::filter::LevelFilter,
 }
 
 struct WarpCore {
     warp_config: warp_config::WarpConfig,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl WarpCore {
-    fn new(warp_config: warp_config::WarpConfig) -> Self {
-        WarpCore { warp_config }
+    fn new(warp_config: warp_config::WarpConfig) -> (Self, tokio::sync::oneshot::Sender<()>) {
+        let (shutdown_notifier, shutdown) = tokio::sync::oneshot::channel();
+        let warp_core = WarpCore { warp_config, shutdown };
+        (warp_core, shutdown_notifier)
     }
 
     async fn run(&mut self) {
@@ -157,7 +163,6 @@ impl WarpCore {
                 let peer_cipher = peer_cipher.clone();
                 async move {
                     while let Some(outbound) = outbound_tunnel_payloads.recv().await {
-                        println!("Tunnel Payload");
                         let mut interfaces = interfaces_watch.borrow().clone();
                         interfaces.retain(|interface| interface.is_alive());
 
@@ -249,12 +254,12 @@ impl WarpCore {
                                                 public_address = %register_response.address,
                                                 one_way_latency_warp_map = std::time::SystemTime::now()
                                                             .duration_since(register_response.timestamp)
-                                                            .unwrap()
-                                                            .as_secs_f32(),
+                                                            .map(|duration| duration.as_secs_f32())
+                                                            .unwrap_or_else(|e| -e.duration().as_secs_f32()),
                                                 round_trip_latency_warp_map = std::time::SystemTime::now()
                                                             .duration_since(register_response.request_timestamp)
-                                                            .unwrap()
-                                                            .as_secs_f32(),
+                                                            .map(|duration| duration.as_secs_f32())
+                                                            .unwrap_or_else(|e| -e.duration().as_secs_f32()),
                                                 "MESSAGE_PROCESSED[RegisterResponse]"
                                             );
                                         }
@@ -268,8 +273,8 @@ impl WarpCore {
                                                 peer_addresses = format!("{:?}", mapping.endpoints),
                                                 one_way_latency_warp_map = std::time::SystemTime::now()
                                                     .duration_since(mapping.timestamp)
-                                                    .unwrap()
-                                                    .as_secs_f32(),
+                                                    .map(|duration| duration.as_secs_f32())
+                                                    .unwrap_or_else(|e| -e.duration().as_secs_f32()),
                                                 "MESSAGE_PROCESSED[MappingResponse]"
                                             );
                                         }
@@ -345,17 +350,55 @@ impl WarpCore {
             .unwrap();
         futures.push(rx_processing_task);
 
+        // Wait for either tasks to complete or shutdown signal
         use futures::StreamExt;
-        while futures.next().await.is_some() {
-            panic!("warp terminated")
+
+        tokio::select! {
+            _ = futures.next() => {
+                panic!("warp terminated unexpectedly")
+            }
+            _ = &mut self.shutdown => {
+                tracing::info!("Graceful shutdown initiated");
+
+                let interfaces = interfaces_rx.borrow().clone();
+                for interface in &interfaces {
+                    let deregister_request = warp_protocol::messages::DeregisterRequest {
+                        pubkey: self.warp_config.private_key.public_key(),
+                        timestamp: std::time::SystemTime::now(),
+                    };
+
+                    if let Ok(data) = deregister_request.encode()
+                        .and_then(|encoded| encoded.encrypt(&warp_map_cipher))
+                        .and_then(|encrypted| encrypted.to_bytes()) {
+
+                        if let Err(e) = interface.queue_send(data, &self.warp_config.warp_map.address, None) {
+                            tracing::warn!(
+                                interface = %interface.id,
+                                error = %e,
+                                "INTERFACE_DEREGISTRATION_FAILED"
+                            );
+                        } else {
+                            tracing::info!(
+                                interface = %interface.id,
+                                "INTERFACE_DEREGISTRATION_SENT"
+                            );
+                        }
+                    }
+                }
+
+                // Give a brief moment for deregister messages to be sent
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tracing::info!("Graceful shutdown complete");
+            }
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
-    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(args.verbosity);
     let tokio_console_layer = console_subscriber::spawn();
 
     tracing_subscriber::registry()
@@ -363,12 +406,10 @@ fn main() -> anyhow::Result<()> {
         .with(stdout_layer)
         .init();
 
-    rt.block_on(async_main())
+    rt.block_on(async_main(args))
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
+async fn async_main(args: Args) -> anyhow::Result<()> {
     let warp_config: warp_config::WarpConfig =
         toml::from_str(std::fs::read_to_string(args.warp_config_path)?.as_str())?;
 
@@ -377,7 +418,27 @@ async fn async_main() -> anyhow::Result<()> {
         warp_protocol::crypto::pubkey_to_string(&warp_config.private_key.public_key())
     );
 
-    WarpCore::new(warp_config).run().await;
+    let (mut warp_core, shutdown) = WarpCore::new(warp_config);
+
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to register SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, initiating graceful shutdown");
+            }
+        }
+
+        let _ = shutdown.send(());
+    });
+
+    warp_core.run().await;
 
     Ok(())
 }

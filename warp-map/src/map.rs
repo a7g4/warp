@@ -40,6 +40,30 @@ impl ClientStore {
         self.address_last_seen.insert(address, now);
     }
 
+    pub fn deregister_client(&mut self, pubkey: &warp_protocol::PublicKey, address: SocketAddr) -> bool {
+        let mut removed = false;
+
+        // Remove the specific address from the pubkey's address set
+        if let Some(addresses) = self.pubkey_to_addresses.get_mut(pubkey) {
+            if addresses.remove(&address) {
+                removed = true;
+
+                // If this was the last address for this pubkey, remove the pubkey entry
+                if addresses.is_empty() {
+                    self.pubkey_to_addresses.remove(pubkey);
+                }
+            }
+        }
+
+        // Clean up reverse mappings
+        if removed {
+            self.address_to_pubkey.remove(&address);
+            self.address_last_seen.remove(&address);
+        }
+
+        removed
+    }
+
     pub fn get_addresses(&self, pubkey: &warp_protocol::PublicKey, now: Instant) -> Vec<SocketAddr> {
         self.pubkey_to_addresses
             .get(pubkey)
@@ -387,5 +411,115 @@ mod tests {
         // Should be included (not expired)
         let addresses = store.get_addresses(&pubkey, now);
         assert_eq!(addresses.len(), 1);
+    }
+
+    #[test]
+    fn test_deregister_client_existing_address() {
+        let mut store = create_test_store();
+        let pubkey = create_test_pubkey(1);
+        let address = create_test_address(8080);
+        let now = Instant::now();
+
+        // Register first
+        store.register_client(pubkey, address, now);
+        assert!(store.get_pubkey(&address).is_some());
+
+        // Deregister
+        let removed = store.deregister_client(&pubkey, address);
+        assert!(removed);
+
+        // Verify complete removal
+        assert_eq!(store.get_pubkey(&address), None);
+        assert!(store.pubkey_to_addresses.get(&pubkey).is_none());
+        assert!(!store.address_last_seen.contains_key(&address));
+    }
+
+    #[test]
+    fn test_deregister_client_nonexistent_address() {
+        let mut store = create_test_store();
+        let pubkey = create_test_pubkey(1);
+        let address = create_test_address(8080);
+
+        let removed = store.deregister_client(&pubkey, address);
+        assert!(!removed);
+    }
+
+    #[test]
+    fn test_deregister_client_partial_addresses() {
+        let mut store = create_test_store();
+        let pubkey = create_test_pubkey(1);
+        let addr1 = create_test_address(8080);
+        let addr2 = create_test_address(8081);
+        let now = Instant::now();
+
+        // Register multiple addresses for same pubkey
+        store.register_client(pubkey, addr1, now);
+        store.register_client(pubkey, addr2, now);
+
+        // Deregister one address
+        let removed = store.deregister_client(&pubkey, addr1);
+        assert!(removed);
+
+        // Verify partial removal
+        assert_eq!(store.get_pubkey(&addr1), None);
+        assert_eq!(store.get_pubkey(&addr2), Some(pubkey));
+        assert!(!store.address_last_seen.contains_key(&addr1));
+        assert!(store.address_last_seen.contains_key(&addr2));
+
+        // Pubkey should still exist with remaining address
+        let addresses = store.pubkey_to_addresses.get(&pubkey).unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses.contains(&addr2));
+        assert!(!addresses.contains(&addr1));
+    }
+
+    #[test]
+    fn test_deregister_client_wrong_pubkey() {
+        let mut store = create_test_store();
+        let pubkey1 = create_test_pubkey(1);
+        let pubkey2 = create_test_pubkey(2);
+        let address = create_test_address(8080);
+        let now = Instant::now();
+
+        // Register with pubkey1
+        store.register_client(pubkey1, address, now);
+
+        // Try to deregister with wrong pubkey
+        let removed = store.deregister_client(&pubkey2, address);
+        assert!(!removed);
+
+        // Verify nothing was removed
+        assert_eq!(store.get_pubkey(&address), Some(pubkey1));
+        assert!(store.pubkey_to_addresses.get(&pubkey1).unwrap().contains(&address));
+    }
+
+    #[test]
+    fn test_deregister_maintains_data_consistency() {
+        let mut store = create_test_store();
+        let pubkey1 = create_test_pubkey(1);
+        let pubkey2 = create_test_pubkey(2);
+        let addr1 = create_test_address(8080);
+        let addr2 = create_test_address(8081);
+        let addr3 = create_test_address(8082);
+        let now = Instant::now();
+
+        // Set up complex scenario
+        store.register_client(pubkey1, addr1, now);
+        store.register_client(pubkey1, addr2, now);
+        store.register_client(pubkey2, addr3, now);
+
+        // Deregister one address from pubkey1
+        store.deregister_client(&pubkey1, addr1);
+
+        // Check data consistency
+        assert_eq!(store.address_to_pubkey.len(), store.address_last_seen.len());
+
+        let total_addresses: usize = store.pubkey_to_addresses.values().map(|addrs| addrs.len()).sum();
+        assert_eq!(total_addresses, store.address_to_pubkey.len());
+
+        // Verify specific state
+        assert_eq!(store.get_pubkey(&addr1), None);
+        assert_eq!(store.get_pubkey(&addr2), Some(pubkey1));
+        assert_eq!(store.get_pubkey(&addr3), Some(pubkey2));
     }
 }

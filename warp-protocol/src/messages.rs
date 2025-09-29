@@ -24,6 +24,25 @@ pub struct RegisterResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, AeadMessage)]
+#[message_id = 0x14]
+pub struct DeregisterRequest {
+    #[AeadSerialisation(bincode(with_serde))]
+    #[Aead(associated_data)]
+    pub pubkey: crate::PublicKey,
+    #[Aead(encrypted)]
+    pub timestamp: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, AeadMessage)]
+#[message_id = 0x15]
+pub struct DeregisterResponse {
+    #[Aead(encrypted)]
+    pub timestamp: std::time::SystemTime,
+    #[Aead(encrypted)]
+    pub request_timestamp: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, AeadMessage)]
 #[message_id = 0x12]
 pub struct MappingRequest {
     #[Aead(encrypted)]

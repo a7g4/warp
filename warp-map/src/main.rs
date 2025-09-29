@@ -70,7 +70,7 @@ impl WarpMapServer {
                     let private_key = self.private_key.clone();
                     let client_store = self.client_store.clone();
 
-                    let task_name = format!("Handle data from {}", address);
+                    let task_name = format!("Handle data from {address}");
 
                     // TODO: I think spawning a new task for each message is overkill; do something better
                     let spawn_result = tokio::task::Builder::new().name(&task_name).spawn(async move {
@@ -173,6 +173,32 @@ impl WarpMapServer {
                         client_key_string,
                         n_addresses,
                         dt.as_secs()
+                    );
+
+                    let bytes = response.encode()?.encrypt(&cipher)?.to_bytes()?;
+                    response_bytes.extend_from_slice(bytes.as_slice());
+                }
+                warp_protocol::messages::DeregisterRequest::MESSAGE_ID => {
+                    let deregister_msg: warp_protocol::messages::DeregisterRequest = decrypted.decode()?;
+
+                    let removed = {
+                        let mut store = client_store.write().await;
+                        store.deregister_client(&client_key, *from)
+                    };
+
+                    let response = warp_protocol::messages::DeregisterResponse {
+                        timestamp: std::time::SystemTime::now(),
+                        request_timestamp: deregister_msg.timestamp,
+                    };
+
+                    let dt = response.timestamp.duration_since(deregister_msg.timestamp)?;
+                    tracing::event!(
+                        name: "DeregisterRequest",
+                        tracing::Level::INFO,
+                        public_key = client_key_string,
+                        address = from.to_string().as_str(),
+                        removed = removed,
+                        clock_network_skew = dt.as_secs_f32()
                     );
 
                     let bytes = response.encode()?.encrypt(&cipher)?.to_bytes()?;
