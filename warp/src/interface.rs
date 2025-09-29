@@ -211,12 +211,8 @@ impl NetworkInterface {
                                     error = %e,
                                     "INTERFACE_RX_FAILED"
                                 );
-                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
-
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
                     }
                 }
             })?;
@@ -234,18 +230,18 @@ impl NetworkInterface {
                 async move {
                     while let Some(tx_payload) = outbound_rx.recv().await {
                         let queue_length = outbound_rx.len();
-                        if let Some(deadline) = tx_payload.deadline {
-                            if deadline < std::time::Instant::now() {
-                                tracing::event!(
-                                    tracing::Level::WARN,
-                                    interface = interface.id.name,
-                                    destination = %tx_payload.to,
-                                    payload_size = tx_payload.data.len(),
-                                    queue_length = queue_length,
-                                    "INTERFACE_SEND_DEADLINE_MISSED"
-                                );
-                                continue;
-                            }
+                        if let Some(deadline) = tx_payload.deadline
+                            && deadline < std::time::Instant::now()
+                        {
+                            tracing::event!(
+                                tracing::Level::WARN,
+                                interface = interface.id.name,
+                                destination = %tx_payload.to,
+                                payload_size = tx_payload.data.len(),
+                                queue_length = queue_length,
+                                "INTERFACE_SEND_DEADLINE_MISSED"
+                            );
+                            continue;
                         }
                         let send_start_time = std::time::Instant::now();
                         let send_result = if let Some(deadline) = tx_payload.deadline {
@@ -322,9 +318,6 @@ impl NetworkInterface {
                                 );
                             }
                         }
-
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
                     }
                 }
             })?;

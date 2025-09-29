@@ -31,10 +31,7 @@ impl ApplicationSocket {
 
                 size
             }
-            Self::UnixDomainSocket(socket) => {
-                
-                socket.recv(buf).await?
-            }
+            Self::UnixDomainSocket(socket) => socket.recv(buf).await?,
         };
         Ok(&buf[..size])
     }
@@ -62,6 +59,7 @@ impl ApplicationSocket {
 pub struct OutboundTunnelPayload {
     pub tunnel_payload: warp_protocol::messages::TunnelPayload,
     pub deadline: std::time::Instant,
+    pub completion_notifier: tokio::sync::oneshot::Sender<()>,
 }
 
 pub struct Gate {
@@ -92,7 +90,7 @@ impl Gate {
         });
 
         let application_listener_task = tokio::task::Builder::new()
-            .name(&format!("warp-gate {}: application to gate listener", tunnel_name))
+            .name(&format!("warp-gate {tunnel_name}: application to gate listener"))
             .spawn({
                 let tracer_generator = std::sync::atomic::AtomicU64::new(0);
                 let tunnel_name = tunnel_name.to_string();
@@ -107,20 +105,44 @@ impl Gate {
                                     tracer_generator.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                     data.to_vec(),
                                 );
-                                let outbound = OutboundTunnelPayload {
-                                    tunnel_payload,
-                                    deadline: std::time::Instant::now() + send_deadline,
-                                };
+                                let tracer = tunnel_payload.tracer;
                                 tracing::event!(
                                     tracing::Level::DEBUG,
                                     tunnel_name = tunnel_name,
-                                    tracer = outbound.tunnel_payload.tracer,
-                                    payload_size = outbound.tunnel_payload.data.len(),
+                                    tracer = tracer,
+                                    payload_size = tunnel_payload.data.len(),
                                     "APPLICATION_TO_GATE_DATA_RX"
                                 );
+
+                                let (completion_notifier, completion_waiter) = tokio::sync::oneshot::channel();
+                                let outbound = OutboundTunnelPayload {
+                                    tunnel_payload,
+                                    deadline: std::time::Instant::now() + send_deadline,
+                                    completion_notifier,
+                                };
+
                                 application_outbound_channel
                                     .send(outbound)
                                     .expect("Channel should be open");
+
+                                // Wait for this tunnel payload to be warped over the interwebs; this will provide
+                                // backpressure to any application that is sending data to us over a "blocking"
+                                // mechanism (like a Unix Domain Socket).
+                                match completion_waiter.await {
+                                    Ok(()) => tracing::event!(
+                                        tracing::Level::DEBUG,
+                                        tunnel_name = tunnel_name,
+                                        tracer = tracer,
+                                        "TUNNEL_PAYLOAD_WARPED"
+                                    ),
+                                    Err(e) => tracing::event!(
+                                        tracing::Level::WARN,
+                                        tunnel_name = tunnel_name,
+                                        tracer = tracer,
+                                        error = %e,
+                                        "TUNNEL_PAYLOAD_WARP_FAILED"
+                                    ),
+                                }
                             }
                             Err(e) => {
                                 tracing::event!(
@@ -131,9 +153,6 @@ impl Gate {
                                 );
                             }
                         }
-
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
                     }
                 }
             })?;
@@ -142,7 +161,7 @@ impl Gate {
             .expect("application_listener_task should not have been set");
 
         let application_sender_task = tokio::task::Builder::new()
-            .name(&format!("warp-gate {}: gate to application tx", tunnel_name))
+            .name(&format!("warp-gate {tunnel_name}: gate to application tx"))
             .spawn({
                 let tunnel_name = tunnel_name.to_string();
                 let socket = socket.clone();
@@ -189,8 +208,6 @@ impl Gate {
                                 );
                             }
                         }
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
                     }
                 }
             })?;

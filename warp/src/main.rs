@@ -205,9 +205,10 @@ impl WarpCore {
                                 }
                             }
                         }
-
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
+                        outbound
+                            .completion_notifier
+                            .send(())
+                            .expect("Tunnel completion listener is not listening");
                     }
                 }
             })
@@ -341,9 +342,6 @@ impl WarpCore {
                             rx_processing_latency_us = rx_processing_duration.as_micros(),
                             "Completed payload processing"
                         );
-
-                        #[cfg(feature = "manual_yields")]
-                        tokio::task::yield_now().await;
                     }
                 }
             })
