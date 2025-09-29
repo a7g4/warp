@@ -6,6 +6,7 @@ fn main() {
             .unwrap(),
         interfaces: warp_config::InterfacesConfig {
             interface_scan_interval: 10,
+            holepunch_keep_alive_interval: std::time::Duration::from_secs(5),
             bind_to_device: Some(false),
             exclusion_patterns: regex::RegexSet::new(vec!["eth.*"]).unwrap(),
             max_consecutive_failures: 10,

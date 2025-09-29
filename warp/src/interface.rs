@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OnceCell, mpsc};
 use tokio::task::JoinHandle;
 
 const BUFFER_SIZE: usize = 65536;
@@ -42,24 +41,30 @@ pub struct NetworkInterface {
     max_consecutive_failures: usize,
 
     consecutive_failures: std::sync::atomic::AtomicUsize,
-    registration_task: OnceCell<JoinHandle<()>>,
-    receiver_task: OnceCell<JoinHandle<()>>,
+    registration_task: tokio::sync::OnceCell<JoinHandle<()>>,
+    receiver_task: tokio::sync::OnceCell<JoinHandle<()>>,
 
-    sender_queue_tx: mpsc::UnboundedSender<TxPayload>,
-    sender_task: OnceCell<JoinHandle<()>>,
+    sender_queue_tx: tokio::sync::mpsc::UnboundedSender<TxPayload>,
+    sender_task: tokio::sync::OnceCell<JoinHandle<()>>,
+
+    // External address as seen by warp-map (for PeerAddressOverride)
+    // TODO: Is this the right way to do this? I just want a C++ like Atomic<Option<SocketAddr>>
+    external_address_notifier: tokio::sync::watch::Sender<Option<SocketAddr>>,
+    external_address_watch: tokio::sync::watch::Receiver<Option<SocketAddr>>,
 }
 
 impl NetworkInterface {
     pub fn new(
         id: NetworkInterfaceId,
         config: &warp_config::WarpConfig,
-        rx_channel: mpsc::UnboundedSender<RxPayload>,
+        rx_channel: tokio::sync::mpsc::UnboundedSender<RxPayload>,
     ) -> anyhow::Result<Arc<Self>> {
         let bind_to_device = config.interfaces.bind_to_device.unwrap_or(false);
         let socket = Self::create_socket(&id, bind_to_device)?;
         let receiver_addr = socket.local_addr()?;
 
         let (outbound_sender, outbound_receiver) = tokio::sync::mpsc::unbounded_channel::<TxPayload>();
+        let (external_address_notifier, external_address_watch) = tokio::sync::watch::channel(None);
 
         let interface = Arc::new(Self {
             id: id.clone(),
@@ -67,10 +72,12 @@ impl NetworkInterface {
             receiver_addr,
             max_consecutive_failures: config.interfaces.max_consecutive_failures,
             consecutive_failures: std::sync::atomic::AtomicUsize::new(0),
-            registration_task: OnceCell::new(),
-            receiver_task: OnceCell::new(),
+            registration_task: tokio::sync::OnceCell::new(),
+            receiver_task: tokio::sync::OnceCell::new(),
             sender_queue_tx: outbound_sender,
-            sender_task: OnceCell::new(),
+            sender_task: tokio::sync::OnceCell::new(),
+            external_address_notifier,
+            external_address_watch,
         });
 
         interface
@@ -176,7 +183,7 @@ impl NetworkInterface {
 
     fn spawn_receiver_task(
         interface: Arc<Self>,
-        rx_channel: mpsc::UnboundedSender<RxPayload>,
+        rx_channel: tokio::sync::mpsc::UnboundedSender<RxPayload>,
     ) -> anyhow::Result<JoinHandle<()>> {
         let task = tokio::task::Builder::new()
             .name(&format!("interface {} receiver", interface.id))
@@ -222,7 +229,7 @@ impl NetworkInterface {
 
     fn spawn_sender_task(
         interface: Arc<Self>,
-        mut outbound_rx: mpsc::UnboundedReceiver<TxPayload>,
+        mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<TxPayload>,
     ) -> anyhow::Result<JoinHandle<()>> {
         let task = tokio::task::Builder::new()
             .name(&format!("interface {} sender", interface.id))
@@ -370,6 +377,14 @@ impl NetworkInterface {
 
     pub fn is_alive(&self) -> bool {
         self.consecutive_failures.load(std::sync::atomic::Ordering::Relaxed) < self.max_consecutive_failures
+    }
+
+    pub fn get_external_address(&self) -> Option<SocketAddr> {
+        *self.external_address_watch.borrow()
+    }
+
+    pub fn set_external_address(&self, address: SocketAddr) {
+        self.external_address_notifier.send_replace(Some(address));
     }
 
     fn stop(&mut self) {

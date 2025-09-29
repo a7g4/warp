@@ -7,6 +7,7 @@ use warp_protocol::codec::Message;
 
 mod interface;
 mod tunnel;
+mod routing;
 
 #[derive(Parser)]
 #[command(name = "warp")]
@@ -33,10 +34,9 @@ impl WarpCore {
 
     async fn run(&mut self) {
         let mut futures = futures::stream::FuturesUnordered::new();
-        // Using a Vec seems the smartest for small numbers of interfaces; switch to a Map if we ever get to large numbers
-        let (interfaces_tx, interfaces_rx) =
-            tokio::sync::watch::channel(Vec::<std::sync::Arc<interface::NetworkInterface>>::new());
-        let (peer_addresses_tx, peer_addresses_rx) = tokio::sync::watch::channel(Vec::<std::net::SocketAddr>::new());
+        
+        // Create consolidated packet routing state
+        let routing_state = std::sync::Arc::new(routing::RoutingState::new());
         let interface_filter = self.warp_config.interfaces.exclusion_patterns.clone();
 
         let warp_map_cipher = warp_protocol::crypto::cipher_from_shared_secret(
@@ -56,7 +56,7 @@ impl WarpCore {
             .spawn({
                 let warp_config = self.warp_config.clone();
                 let mut interfaces = Vec::new();
-                let interfaces_tx = interfaces_tx.clone();
+                let routing_state = routing_state.clone();
                 async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                         warp_config.interfaces.interface_scan_interval,
@@ -122,7 +122,7 @@ impl WarpCore {
                                 }
                             }
                         }
-                        interfaces_tx.send_replace(interfaces.clone());
+                        routing_state.interfaces_sender().send_replace(interfaces.clone());
                     }
                 }
             })
@@ -155,16 +155,74 @@ impl WarpCore {
         }
         let tunnel_gates = std::sync::Arc::new(tunnel_gates);
 
+        let override_sender_task = tokio::task::Builder::new()
+            .name("Holepunching: peer address override sender")
+            .spawn({
+                let routing_state = routing_state.clone();
+                let peer_cipher = peer_cipher.clone();
+                let warp_config = self.warp_config.clone();
+
+                async move {
+                    let mut interval = tokio::time::interval(
+                        warp_config.interfaces.holepunch_keep_alive_interval
+                    );
+
+                    loop {
+                        interval.tick().await;
+
+                        let interfaces = routing_state.interfaces();
+
+                        for interface in interfaces.iter() {
+                            if !interface.is_alive() {
+                                continue;
+                            }
+
+                            // Send override message if we know our external address
+                            if let Some(external_addr) = interface.get_external_address() {
+                                let override_msg =
+                                    warp_protocol::messages::PeerAddressOverride { replace: external_addr };
+
+                                if let Ok(data) = override_msg
+                                    .encode()
+                                    .and_then(|encoded| encoded.encrypt(&peer_cipher))
+                                    .and_then(|encrypted| encrypted.to_bytes())
+                                {
+                                    for peer_addr in routing_state.resolve_peer_addresses(&interface.id.name) {
+                                        if let Err(e) = interface.queue_send(data.clone(), &peer_addr, None) {
+                                            tracing::event!(
+                                                tracing::Level::WARN,
+                                                interface = %interface.id,
+                                                peer_addr = %peer_addr,
+                                                error = %e,
+                                                "OVERRIDE_SEND_FAILED"
+                                            );
+                                        } else {
+                                            tracing::event!(
+                                                tracing::Level::DEBUG,
+                                                interface = %interface.id,
+                                                peer_addr = %peer_addr,
+                                                replace_addr = %external_addr,
+                                                "OVERRIDE_SENT_PERIODIC"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        futures.push(override_sender_task);
+
         let warp_accelerator_task = tokio::task::Builder::new()
             .name("warp-accelerator")
             .spawn({
-                let interfaces_watch = interfaces_rx.clone();
-                let peer_addresses_rx = peer_addresses_rx.clone();
+                let routing_state = routing_state.clone();
                 let peer_cipher = peer_cipher.clone();
+
                 async move {
                     while let Some(outbound) = outbound_tunnel_payloads.recv().await {
-                        let mut interfaces = interfaces_watch.borrow().clone();
-                        interfaces.retain(|interface| interface.is_alive());
 
                         let tracer = outbound.tunnel_payload.tracer;
 
@@ -178,18 +236,19 @@ impl WarpCore {
                             .to_bytes()
                             .unwrap();
 
-                        let peer_addresses = peer_addresses_rx.borrow().clone();
-
                         // TODO: Here is where we can pick the routes from the cross product of interfaces and peer addresses
                         // TODO: Here is where we can query each interface's send queue size/failure rate etc.
-                        for interface in &interfaces {
-                            for peer_address in &peer_addresses {
-                                match interface.queue_send(data.clone(), peer_address, Some(outbound.deadline)) {
+                        for interface in routing_state.interfaces().iter().filter(|interface| interface.is_alive()) {
+                            let resolved_addresses = routing_state.resolve_peer_addresses(&interface.id.name);
+                            
+                            for resolved_address in &resolved_addresses {
+                                match interface.queue_send(data.clone(), resolved_address, Some(outbound.deadline)) {
                                     Ok(()) => {
                                         tracing::event!(
                                             tracing::Level::DEBUG,
                                             tracer = tracer,
                                             interface = %interface.id,
+                                            resolved_addr = %resolved_address,
                                             "TUNNEL_PAYLOAD_SEND_QUEUED"
                                         );
                                     }
@@ -198,6 +257,7 @@ impl WarpCore {
                                             tracing::Level::WARN,
                                             tracer = tracer,
                                             interface = %interface.id,
+                                            resolved_addr = %resolved_address,
                                             error = %e,
                                             "TUNNEL_PAYLOAD_SEND_QUEUE_ERROR"
                                         );
@@ -219,7 +279,7 @@ impl WarpCore {
         let rx_processing_task = tokio::task::Builder::new()
             .name("global rx processor")
             .spawn({
-                let peer_addresses_tx = peer_addresses_tx.clone();
+                let routing_state = routing_state.clone();
                 let warp_config = self.warp_config.clone();
                 let warp_map_cipher = warp_map_cipher.clone();
                 let tunnel_gates = tunnel_gates.clone();
@@ -249,6 +309,16 @@ impl WarpCore {
                                         warp_protocol::messages::RegisterResponse::MESSAGE_ID => {
                                             let register_response: warp_protocol::messages::RegisterResponse =
                                                 decrypted_wire_msg.decode().unwrap();
+
+                                            // Update external address for the receiving interface
+                                            let interfaces = routing_state.interfaces();
+                                            for interface in interfaces.iter() {
+                                                if interface.id.name == payload.receiver_name {
+                                                    interface.set_external_address(register_response.address);
+                                                    break;
+                                                }
+                                            }
+
                                             tracing::event!(
                                                 tracing::Level::INFO,
                                                 interface = payload.receiver_name,
@@ -267,11 +337,13 @@ impl WarpCore {
                                         warp_protocol::messages::MappingResponse::MESSAGE_ID => {
                                             let mapping: warp_protocol::messages::MappingResponse =
                                                 decrypted_wire_msg.decode().unwrap();
-                                            peer_addresses_tx.send_replace(mapping.endpoints.clone());
+                                            routing_state.handle_mapping_response(&mapping);
+
                                             tracing::event!(
                                                 tracing::Level::INFO,
                                                 interface = payload.receiver_name,
                                                 peer_addresses = format!("{:?}", mapping.endpoints),
+                                                active_overrides = routing_state.active_overrides_count(),
                                                 one_way_latency_warp_map = std::time::SystemTime::now()
                                                     .duration_since(mapping.timestamp)
                                                     .map(|duration| duration.as_secs_f32())
@@ -307,6 +379,13 @@ impl WarpCore {
                                                     }
                                                     Some(gate) => gate.send_to_application(tunnel_payload).await,
                                                 }
+                                            }
+                                            warp_protocol::messages::PeerAddressOverride::MESSAGE_ID => {
+                                                let override_msg: warp_protocol::messages::PeerAddressOverride =
+                                                    decrypted_wire_msg.decode().unwrap();
+
+                                                // Update address override for the specific interface that received this message
+                                                routing_state.handle_peer_address_override(&override_msg, from, &payload.receiver_name);
                                             }
                                             _ => {
                                                 tracing::warn!(
@@ -358,8 +437,8 @@ impl WarpCore {
             _ = &mut self.shutdown => {
                 tracing::info!("Graceful shutdown initiated");
 
-                let interfaces = interfaces_rx.borrow().clone();
-                for interface in &interfaces {
+                let interfaces = routing_state.interfaces();
+                for interface in interfaces.iter() {
                     let deregister_request = warp_protocol::messages::DeregisterRequest {
                         pubkey: self.warp_config.private_key.public_key(),
                         timestamp: std::time::SystemTime::now(),

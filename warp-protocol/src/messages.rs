@@ -109,6 +109,14 @@ impl TunnelPayload {
     }
 }
 
+// This message is sent to inform a peer to send to the origin of this message instead of the specified address.
+#[derive(Debug, Clone, PartialEq, AeadMessage)]
+#[message_id = 0xF2]
+pub struct PeerAddressOverride {
+    #[Aead(encrypted)]
+    pub replace: std::net::SocketAddr,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

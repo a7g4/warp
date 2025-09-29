@@ -51,6 +51,7 @@ where
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InterfacesConfig {
     pub interface_scan_interval: u64,
+    pub holepunch_keep_alive_interval: std::time::Duration,
     pub bind_to_device: Option<bool>,
     #[serde(
         serialize_with = "serialize_interface_exclusions",
