@@ -316,9 +316,9 @@ mod tests {
         let decrypted_msg = rx_encrypted_msg.decrypt(&cipher).unwrap();
         let reconstructed_msg: WithCustomNonce = decrypted_msg.decode().unwrap();
 
-        // The reconstructed message should have the original data but default nonce field
+        // The reconstructed message should have the original data and retain nonce field
         assert_eq!(reconstructed_msg.data, msg.data);
-        // The nonce field gets set to default (zeros) during reconstruction
-        assert_eq!(reconstructed_msg.custom_nonce, 0u64);
+        // The nonce field retains its original value during reconstruction
+        assert_eq!(reconstructed_msg.custom_nonce, 0x1234567890ABCDEFu64);
     }
 }

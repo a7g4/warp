@@ -25,14 +25,14 @@ pub fn cipher_from_shared_secret(private_key: &crate::PrivateKey, peer_pubkey: &
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(shared_secret.raw_secret_bytes().as_slice());
     let key = hasher.finalize();
-    
+
     crate::Cipher::new(&aead::Key::<crate::Cipher>::from(key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use aead::{Aead, AeadCore, Payload};
 
     #[test]

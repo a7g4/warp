@@ -70,23 +70,23 @@ pub enum TunnelId {
     Id(u64),
 }
 
-impl Default for TunnelId {
-    fn default() -> Self {
-        TunnelId::Id(0)
-    }
+#[derive(Debug, Clone, PartialEq, bincode::Encode, bincode::Decode)]
+pub struct MultipartIdentifier {
+    parent_tracer: u64,
+    num_parts: u64,
+    part_id: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, bincode::Encode, bincode::Decode)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, bincode::Encode, bincode::Decode, Default)]
 pub enum ReconstructionTag {
     #[default]
     Plain,
-    Xor(u32, u32),
+    Xor(u64, u64), // This payload is the XOR of two other payloads with these tracer ids
+    Multipart(MultipartIdentifier),
 }
 
-
 #[derive(Debug, Clone, PartialEq, AeadMessage)]
-#[message_id = 0xF1]
+#[message_id = 0xF1] // Warp at faster than F1 speeds!
 pub struct TunnelPayload {
     #[Aead(encrypted)]
     pub tunnel_id: TunnelId,
@@ -153,9 +153,11 @@ mod tests {
         use crate::codec::Message;
         use aead::KeyInit;
 
+        const NONCE: u64 = 42;
+
         let cipher = crate::Cipher::new(&aead::Key::<crate::Cipher>::from(TEST_KEY));
         let data = vec![1, 2, 3, 4, 5];
-        let message = TunnelPayload::new(TunnelId::Id(42), 0, data.clone());
+        let message = TunnelPayload::new(TunnelId::Id(42), NONCE, data.clone());
 
         // Test that extract_nonce returns the tracer bytes
         let mut extracted_nonce = None;
@@ -186,7 +188,7 @@ mod tests {
         assert_eq!(reconstructed_msg.tunnel_id, message.tunnel_id);
         assert_eq!(reconstructed_msg.reconstruction_tag, message.reconstruction_tag);
         assert_eq!(reconstructed_msg.data, message.data);
-        // The tracer field gets set to default (0) during reconstruction since it's a nonce field
-        assert_eq!(reconstructed_msg.tracer, 0u64);
+        // The tracer field retains its original value during reconstruction since it's a nonce field
+        assert_eq!(reconstructed_msg.tracer, NONCE);
     }
 }
