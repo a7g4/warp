@@ -6,8 +6,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use warp_protocol::codec::Message;
 
 mod interface;
-mod tunnel;
 mod routing;
+mod tunnel;
 
 #[derive(Parser)]
 #[command(name = "warp")]
@@ -34,7 +34,7 @@ impl WarpCore {
 
     async fn run(&mut self) {
         let mut futures = futures::stream::FuturesUnordered::new();
-        
+
         // Create consolidated packet routing state
         let routing_state = std::sync::Arc::new(routing::RoutingState::new());
         let interface_filter = self.warp_config.interfaces.exclusion_patterns.clone();
@@ -163,9 +163,7 @@ impl WarpCore {
                 let warp_config = self.warp_config.clone();
 
                 async move {
-                    let mut interval = tokio::time::interval(
-                        warp_config.interfaces.holepunch_keep_alive_interval
-                    );
+                    let mut interval = tokio::time::interval(warp_config.interfaces.holepunch_keep_alive_interval);
 
                     loop {
                         interval.tick().await;
@@ -223,7 +221,6 @@ impl WarpCore {
 
                 async move {
                     while let Some(outbound) = outbound_tunnel_payloads.recv().await {
-
                         let tracer = outbound.tunnel_payload.tracer;
 
                         // TODO: Error handle this better
@@ -238,9 +235,13 @@ impl WarpCore {
 
                         // TODO: Here is where we can pick the routes from the cross product of interfaces and peer addresses
                         // TODO: Here is where we can query each interface's send queue size/failure rate etc.
-                        for interface in routing_state.interfaces().iter().filter(|interface| interface.is_alive()) {
+                        for interface in routing_state
+                            .interfaces()
+                            .iter()
+                            .filter(|interface| interface.is_alive())
+                        {
                             let resolved_addresses = routing_state.resolve_peer_addresses(&interface.id.name);
-                            
+
                             for resolved_address in &resolved_addresses {
                                 match interface.queue_send(data.clone(), resolved_address, Some(outbound.deadline)) {
                                     Ok(()) => {
@@ -385,7 +386,11 @@ impl WarpCore {
                                                     decrypted_wire_msg.decode().unwrap();
 
                                                 // Update address override for the specific interface that received this message
-                                                routing_state.handle_peer_address_override(&override_msg, from, &payload.receiver_name);
+                                                routing_state.handle_peer_address_override(
+                                                    &override_msg,
+                                                    from,
+                                                    &payload.receiver_name,
+                                                );
                                             }
                                             _ => {
                                                 tracing::warn!(

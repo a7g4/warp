@@ -236,7 +236,7 @@ impl Sender {
                 self.tx_timestamps.push_back(current_time);
                 Ok(())
             }
-            Ok(len) => Err(anyhow::anyhow!("Only sent {} bytes of {}", len, PACKET_SIZE)),
+            Ok(len) => Err(anyhow::anyhow!("Only sent {len} bytes of {PACKET_SIZE}")),
             Err(e) => Err(anyhow::Error::new(e)),
         }
     }

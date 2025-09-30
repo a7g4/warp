@@ -9,6 +9,7 @@ struct Args {
     // Note: The pattern may be found anywhere in the string; use ^ or $ to anchor to the beginning/end respectively
     //
     // Note: Not all letters are present in the serialisation alphabet (i, l, o, u) to avoid ambiguous characters
+    //       The possible characters are: `0123456789ABCDEFGHJKMNPQRSTVWXYZ`
     //
     // Note: The public key has a very high likelihood of beginning with '0'
     #[arg()]
@@ -33,7 +34,7 @@ fn main() -> Result<(), anyhow::Error> {
                 "Private key: {}",
                 warp_protocol::crypto::privkey_to_string(&private_key)
             );
-            println!("Public key: {}", public_key_string);
+            println!("Public key: {public_key_string}");
             break;
         }
     }
