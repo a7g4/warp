@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const BUFFER_SIZE: usize = 65536;
@@ -146,6 +145,9 @@ impl NetworkInterface {
         Ok(tokio::net::UdpSocket::from_std(std_socket)?)
     }
 
+    // Having the interface manage its own registration task means the interface needs to know a lot about the things
+    // like the warp-map, keys etc.
+    // TODO: Move the registration task out into main.rs
     fn spawn_registration_task(
         interface: Arc<Self>,
         config: &warp_config::WarpConfig,
@@ -158,8 +160,7 @@ impl NetworkInterface {
                 let warp_map_addr = config.warp_map.address;
                 let cipher =
                     warp_protocol::crypto::cipher_from_shared_secret(&config.private_key, &config.warp_map.public_key);
-                let mut interval =
-                    tokio::time::interval(Duration::from_secs(config.interfaces.interface_scan_interval));
+                let mut interval = tokio::time::interval(config.interfaces.interface_scan_interval);
 
                 async move {
                     loop {

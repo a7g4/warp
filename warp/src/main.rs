@@ -37,7 +37,8 @@ impl WarpCore {
 
         // Create consolidated packet routing state
         let routing_state = std::sync::Arc::new(routing::RoutingState::new());
-        let interface_filter = self.warp_config.interfaces.exclusion_patterns.clone();
+        let interface_exclusion_patterns = self.warp_config.interfaces.exclusion_patterns.clone();
+        let interface_inclusion_patterns = self.warp_config.interfaces.inclusion_patterns.clone();
 
         let warp_map_cipher = warp_protocol::crypto::cipher_from_shared_secret(
             &self.warp_config.private_key,
@@ -58,9 +59,7 @@ impl WarpCore {
                 let mut interfaces = Vec::new();
                 let routing_state = routing_state.clone();
                 async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                        warp_config.interfaces.interface_scan_interval,
-                    ));
+                    let mut interval = tokio::time::interval(warp_config.interfaces.interface_scan_interval);
 
                     loop {
                         interval.tick().await;
@@ -70,7 +69,8 @@ impl WarpCore {
                             // TODO: Only querying for IPv4 interfaces; IPv6 should also just work but we haven't tested them
                             let ipv4_interfacse: Vec<_> = pnet::datalink::interfaces()
                                 .iter()
-                                .filter(|iface| !interface_filter.is_match(&iface.name))
+                                .filter(|iface| interface_inclusion_patterns.is_match(&iface.name))
+                                .filter(|iface| !interface_exclusion_patterns.is_match(&iface.name))
                                 .filter_map(|iface| {
                                     iface
                                         .ips

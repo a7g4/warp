@@ -5,10 +5,11 @@ fn main() {
         private_key: warp_protocol::crypto::privkey_from_string("2ZHQBY729J6XEQNT8HFH3P61401VYZXG8AX3ZP4CJA3ZY9XHJZ10")
             .unwrap(),
         interfaces: warp_config::InterfacesConfig {
-            interface_scan_interval: 10,
+            interface_scan_interval: std::time::Duration::from_secs(10),
             holepunch_keep_alive_interval: std::time::Duration::from_secs(5),
             bind_to_device: Some(false),
             exclusion_patterns: regex::RegexSet::new(vec!["eth.*"]).unwrap(),
+            inclusion_patterns: regex::RegexSet::new(vec![".*"]).unwrap(),
             max_consecutive_failures: 10,
         },
         warp_map: warp_config::WarpMapConfig {
